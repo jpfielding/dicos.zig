@@ -1,0 +1,25 @@
+# Zig build artifacts
+zig-cache/
+zig-out/
+zig-pkg/
+.zig-cache/
+
+# OS-specific files
+.DS_Store
+.env
+.history
+
+
+*.local.json
+
+# Sensitive files
+*.pem
+
+# intermediate from blender to dicos
+voxels.raw
+
+# Editors and IDEs
+# JetBrains IDEs
+.idea/
+# VS Code
+.vscode/
