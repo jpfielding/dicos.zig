@@ -119,7 +119,14 @@ pub const GraphicsContext = struct {
         window_provider: WindowProvider,
         options: GraphicsContextOptions,
     ) !*GraphicsContext {
-        if (!emscripten) dawnProcSetProcs(dnGetProcs());
+        if (emscripten) {
+            // Browser: the page's JS already did requestAdapter/requestDevice and set
+            // Module.preinitializedWebGPUDevice, so no ASYNCIFY/JSPI is needed here.
+            const instance = wgpu.createInstance(.{});
+            const device = emscripten_webgpu_get_device();
+            return finishCreate(allocator, window_provider, options.present_mode, null, instance, device);
+        }
+        dawnProcSetProcs(dnGetProcs());
 
         const native_instance = if (!emscripten) dniCreate();
         errdefer if (!emscripten) dniDestroy(native_instance);
@@ -249,6 +256,18 @@ pub const GraphicsContext = struct {
         };
         errdefer device.release();
 
+        return finishCreate(allocator, window_provider, options.present_mode, native_instance, instance, device);
+    }
+
+    fn finishCreate(
+        allocator: std.mem.Allocator,
+        window_provider: WindowProvider,
+        present_mode: wgpu.PresentMode,
+        native_instance: DawnNativeInstance,
+        instance: wgpu.Instance,
+        device: wgpu.Device,
+    ) !*GraphicsContext {
+        // (device/instance cleanup on error is the caller's errdefer)
         device.setUncapturedErrorCallback(logUnhandledError, null);
 
         const surface = createSurfaceForWindow(instance, window_provider);
@@ -262,7 +281,7 @@ pub const GraphicsContext = struct {
             .format = swapchain_format,
             .width = @intCast(framebuffer_size[0]),
             .height = @intCast(framebuffer_size[1]),
-            .present_mode = options.present_mode,
+            .present_mode = present_mode,
         };
         const swapchain = device.createSwapChain(surface, swapchain_descriptor);
         errdefer swapchain.release();
@@ -1125,6 +1144,7 @@ extern fn dnGetProcs() DawnProcsTable;
 extern fn dawnProcSetProcs(procs: DawnProcsTable) void;
 
 extern fn emscripten_sleep(ms: u32) void;
+extern fn emscripten_webgpu_get_device() wgpu.Device;
 
 /// Helper to create a buffer BindGroupLayoutEntry.
 pub fn bufferEntry(
