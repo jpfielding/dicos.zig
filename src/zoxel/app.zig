@@ -68,6 +68,7 @@ pub const App = struct {
             .loader = loader_mod.VolumeLoader.init(gpa),
         };
         app.state.can_pick_folder = platform.has_folder_picker;
+        app.state.browser = platform.is_web;
         return app;
     }
 
@@ -105,6 +106,12 @@ pub const App = struct {
     /// Load in-memory files (e.g. a browser picker). Takes ownership.
     pub fn loadFiles(self: *App, source: loader_mod.LoadSource) void {
         self.requestLoad(source);
+    }
+
+    /// Show a load failure that happened outside the loader (e.g. a browser
+    /// fetch), as the study panel shows parse errors.
+    pub fn reportLoadError(self: *App, msg: []const u8) void {
+        self.state.setLoadError(self.gpa, msg);
     }
 
     fn requestLoad(self: *App, source: loader_mod.LoadSource) void {
@@ -148,6 +155,7 @@ pub const App = struct {
         self.state.actions.upload_3d_index = null;
         self.state.actions.pick_file = false;
         self.state.actions.pick_folder = false;
+        self.state.actions.load_sample = false;
         self.state.slice_texture_size = if (self.slice_view_h != null) self.slice_size else null;
         slice_panel.slice_texture = if (self.slice_view_h) |h| textureRef(self.gctx, h) else null;
 
@@ -191,8 +199,12 @@ pub const App = struct {
             st.fit_camera = false;
         }
         if (st.actions.pick_file) {
-            if (platform.pick(self.gpa, .file)) |p| self.requestLoad(.{ .path = p });
+            // The browser picker is asynchronous: files arrive via loadFiles.
+            if (platform.is_web) {
+                platform.pickBrowserFiles();
+            } else if (platform.pick(self.gpa, .file)) |p| self.requestLoad(.{ .path = p });
         }
+        if (st.actions.load_sample) platform.loadBrowserSample();
         if (st.actions.pick_folder) {
             if (platform.pick(self.gpa, .folder)) |p| self.requestLoad(.{ .path = p });
         }

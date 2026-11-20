@@ -391,3 +391,30 @@ test "phone focus and expanded views draw" {
         h.run(&state, size);
     }
 }
+
+test "browser open buttons: Load sample instead of Open folder" {
+    const size = Vec2{ .x = 1100, .y = 720 };
+    var h = Harness.init();
+    defer h.deinit();
+    // First-use screen and the study sidebar both offer the browser actions.
+    var empty = UiState.init(.{});
+    defer empty.deinit(testing.allocator);
+    empty.browser = true;
+    empty.can_pick_folder = false;
+    try h.assertFits("browser first use", &empty, size);
+    try testing.expect(h.textCenter("Open folder\u{2026}") == null);
+    try h.tap(&empty, size, "Load sample");
+    try testing.expect(empty.actions.load_sample);
+    try testing.expect(!empty.actions.pick_file);
+
+    var state = try smallStudy();
+    defer state.deinit(testing.allocator);
+    state.browser = true;
+    state.can_pick_folder = false;
+    try h.assertFits("browser study", &state, size);
+    try testing.expect(h.textCenter("Open folder\u{2026}") == null);
+    try h.tap(&state, size, "Open file\u{2026}");
+    try testing.expect(state.actions.pick_file);
+    try h.tap(&state, size, "Load sample");
+    try testing.expect(state.actions.load_sample);
+}

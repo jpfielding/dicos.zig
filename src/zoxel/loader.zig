@@ -120,7 +120,8 @@ pub const VolumeLoader = struct {
             src.deinit(self.gpa);
             return;
         };
-        if (self.use_thread) {
+        // Comptime guard: single-threaded targets cannot compile Thread.spawn.
+        if (platform.has_threads and self.use_thread) {
             if (self.thread) |t| {
                 t.join();
                 self.thread = null;

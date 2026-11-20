@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Zoxel — DICOS volume viewer</title>
+    <link rel="icon" href="data:," />
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #111418; color: #d8dee9;
+        font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+      /* zoxel sizes its window to #stage; Emscripten's GLFW then sets the
+         canvas size. zgpu hard-codes the "#canvas" selector. */
+      #stage { position: fixed; inset: 0; width: 100vw; height: 100vh; }
+      #canvas { display: block; outline: none; touch-action: none; }
+      #zoxel-error { display: none; position: fixed; inset: 0; padding: 2rem; max-width: 46rem;
+        margin: auto; height: fit-content; background: #1b2028; border: 1px solid #3b4252;
+        border-radius: 8px; white-space: pre-wrap; }
+      #zoxel-status { display: none; position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+        padding: 4px 12px; border-radius: 999px; background: #1b2028; border: 1px solid #3b4252;
+        font-size: 13px; pointer-events: none; }
+    </style>
+  </head>
+  <body>
+    <div id="stage"><canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas></div>
+    <div id="zoxel-error" role="alert"></div>
+    <div id="zoxel-status" role="status" aria-live="polite"></div>
+    <input id="zoxel-file" type="file" accept=".dcs,.dcm" multiple hidden />
+    <noscript>Zoxel needs JavaScript and WebGPU.</noscript>
+    <script>
+      // Relative URLs, so the page also works under a GitHub Pages /repo/ path.
+      const SAMPLE = ["samples/fishtank-knife/ct.dcs", "samples/fishtank-knife/tdr.dcs"];
+
+      const fail = (why) => {
+        const el = document.getElementById("zoxel-error");
+        el.textContent = why + "\n\nZoxel's web build needs WebGPU: a recent desktop Chrome or Edge, " +
+          "Safari 26+, or Firefox 141+ on Windows.";
+        el.style.display = "block";
+        document.getElementById("stage").style.display = "none";
+      };
+      const status = (text) => {
+        const el = document.getElementById("zoxel-status");
+        el.textContent = text || "";
+        el.style.display = text ? "block" : "none";
+      };
+
+      // Copy bytes into the wasm heap. zoxel owns the buffer afterwards.
+      // Read Module.HEAPU8 after each allocation: memory growth replaces it.
+      const toHeap = (bytes) => {
+        const ptr = Module._zoxel_alloc(bytes.length);
+        if (!ptr) throw new Error("out of memory for " + bytes.length + " bytes");
+        Module.HEAPU8.set(bytes, ptr);
+        return ptr;
+      };
+      const reportError = (message) => {
+        console.error(message);
+        try {
+          const bytes = new TextEncoder().encode(message);
+          Module._zoxel_report_error(toHeap(bytes), bytes.length);
+        } catch (e) {
+          status(message);
+        }
+      };
+      // Hand a set of files to zoxel as one study (the largest is the CT; the
+      // rest are searched for threat reports). It parses them next frame.
+      const openFiles = (files) => {
+        try {
+          for (const { name, bytes } of files) {
+            const nameBytes = new TextEncoder().encode(name);
+            const namePtr = toHeap(nameBytes);
+            let dataPtr;
+            try {
+              dataPtr = toHeap(bytes);
+            } catch (e) {
+              Module._zoxel_free(namePtr, nameBytes.length);
+              throw e;
+            }
+            Module._zoxel_add_file(namePtr, nameBytes.length, dataPtr, bytes.length);
+          }
+        } finally {
+          Module._zoxel_open_files();
+        }
+      };
+
+      const fetchBytes = async (url) => {
+        const r = await fetch(url);
+        if (!r.ok) throw new Error(url + ": HTTP " + r.status);
+        return new Uint8Array(await r.arrayBuffer());
+      };
+
+      var Module = {
+        canvas: document.getElementById("canvas"),
+        print: (t) => console.log(t),
+        printErr: (t) => console.error(t),
+        onAbort: (why) => fail("Zoxel stopped: " + why),
+        // Hold main() until WebGPU is known to work, so a missing GPU shows a
+        // message instead of a blank page.
+        preRun: [() => {
+          addRunDependency("webgpu");
+          (async () => {
+            if (!navigator.gpu) return fail("This browser does not expose WebGPU.");
+            try {
+              const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+              if (!adapter) return fail("No WebGPU adapter is available.");
+              // The renderer needs no optional features (the volume is
+              // rgba16float, which is always filterable) and default limits,
+              // as on the desktop. zgpu takes this device through
+              // emscripten_webgpu_get_device(), so no ASYNCIFY is needed.
+              const device = await adapter.requestDevice();
+              device.lost.then((info) => {
+                if (info.reason !== "destroyed") fail("The GPU device was lost: " + info.message);
+              });
+              Module.preinitializedWebGPUDevice = device;
+            } catch (e) {
+              return fail("WebGPU adapter request failed: " + e);
+            }
+            removeRunDependency("webgpu");
+          })();
+        }],
+        // First launch opens the bundled sample.
+        postRun: [() => Module.zoxelLoadSample()],
+
+        // Called from zoxel (emscripten_run_script) for "Open file…": runs in
+        // the frame after the click, within the browser's user activation.
+        zoxelPickFiles: () => document.getElementById("zoxel-file").click(),
+
+        // Called on first launch and for "Load sample". The threat report is
+        // optional: without it the CT still opens.
+        zoxelLoadSample: async () => {
+          status("Downloading the sample scan…");
+          try {
+            const [ct, tdr] = await Promise.allSettled(SAMPLE.map(fetchBytes));
+            if (ct.status === "rejected") throw ct.reason;
+            const files = [{ name: "ct.dcs", bytes: ct.value }];
+            if (tdr.status === "fulfilled") files.push({ name: "tdr.dcs", bytes: tdr.value });
+            else console.warn("Sample threat report unavailable:", tdr.reason);
+            openFiles(files);
+          } catch (e) {
+            reportError("Failed to load the sample: " + e.message);
+          } finally {
+            status("");
+          }
+        },
+      };
+
+      document.getElementById("zoxel-file").onchange = async (ev) => {
+        const picked = Array.from(ev.target.files);
+        ev.target.value = "";
+        if (picked.length === 0) return;
+        try {
+          const files = await Promise.all(picked.map(async (f) => ({ name: f.name, bytes: new Uint8Array(await f.arrayBuffer()) })));
+          openFiles(files);
+        } catch (e) {
+          reportError("Failed to read the files: " + e.message);
+        }
+      };
+    </script>
+    {{{ SCRIPT }}}
+  </body>
+</html>

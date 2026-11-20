@@ -10,6 +10,10 @@
 //!   [ZOXEL_SCREENSHOT_EXPANDED=1] [ZOXEL_SCREENSHOT_FOCUS=1]
 //!   [ZOXEL_SCREENSHOT_CUTAWAY=1] [ZOXEL_SCREENSHOT_CLICK=x,y;x,y]
 //!   zoxel [path]
+//!
+//! The browser build (wasm32-emscripten) uses the same window, input, ImGui
+//! and frame code; `web.zig` is its root and supplies the entry point and
+//! frame loop.
 
 const std = @import("std");
 const zglfw = @import("zglfw");
@@ -87,13 +91,24 @@ fn focusCb(_: *zglfw.Window, focused: zglfw.Bool) callconv(.c) void {
     }
 }
 
-fn getFramebufferSize(win: *const anyopaque) [2]u32 {
+/// Route GLFW input into `g_input`. Install before `zgui.backend.init`: the
+/// ImGui GLFW backend chains to these.
+pub fn installInputCallbacks(window: *zglfw.Window) void {
+    g_window = window;
+    _ = window.setCursorPosCallback(cursorPosCb);
+    _ = window.setMouseButtonCallback(mouseButtonCb);
+    _ = window.setScrollCallback(scrollCb);
+    _ = window.setKeyCallback(keyCb);
+    _ = window.setFocusCallback(focusCb);
+}
+
+pub fn getFramebufferSize(win: *const anyopaque) [2]u32 {
     const w: *zglfw.Window = @ptrCast(@alignCast(@constCast(win)));
     const s = w.getFramebufferSize();
     return .{ @intCast(@max(s[0], 1)), @intCast(@max(s[1], 1)) };
 }
 
-const Capture = struct {
+pub const Capture = struct {
     path: []const u8,
     size: [2]i32,
     expanded: bool,
@@ -147,16 +162,11 @@ pub fn main() !void {
         return;
     };
     defer window.destroy();
-    g_window = window;
     // Minimum window; a capture may request a smaller (phone) viewport.
     window.setSizeLimits(@min(size[0], 1100), @min(size[1], 720), -1, -1);
 
     // Our callbacks first: the ImGui GLFW backend chains to them.
-    _ = window.setCursorPosCallback(cursorPosCb);
-    _ = window.setMouseButtonCallback(mouseButtonCb);
-    _ = window.setScrollCallback(scrollCb);
-    _ = window.setKeyCallback(keyCb);
-    _ = window.setFocusCallback(focusCb);
+    installInputCallbacks(window);
 
     const gctx = zgpu.GraphicsContext.create(gpa, .{
         .window = window,
@@ -169,24 +179,13 @@ pub fn main() !void {
     };
     defer gctx.destroy(gpa);
 
-    zgui.init(gpa);
+    const fonts = initImgui(gpa, window, gctx);
     defer zgui.deinit();
-    zgui.io.setIniFilename(null);
-    var cfg = zgui.FontConfig.init();
-    cfg.font_data_owned_by_atlas = false;
-    const font = zgui.io.addFontFromMemoryWithConfig(ubuntu_light, 13.5 * 1.121, cfg, null);
-    zgui.io.setDefaultFont(font);
-    var mcfg = zgui.FontConfig.init();
-    mcfg.font_data_owned_by_atlas = false;
-    const mono = zgui.io.addFontFromMemoryWithConfig(hack_regular, 11.0, mcfg, null);
-    zgui.backend.init(window, gctx.device, @intFromEnum(zgpu.GraphicsContext.swapchain_format), @intFromEnum(wgpu.TextureFormat.undef));
     defer zgui.backend.deinit();
 
     var app = app_mod.App.init(gpa, gctx, zgpu.GraphicsContext.swapchain_format);
     defer app.deinit();
-    app.ctx.proportional.font = font;
-    // Hack: ascent 0.759 + descent 0.241 = 1 em; row adds the 0.164 gap.
-    app.ctx.monospace = .{ .font = mono, .em_to_px = 1.0, .row_factor = 1.164 };
+    useFonts(&app, fonts);
 
     if (capture) |c| {
         if (c.expanded) app.expandSliceView();
@@ -198,71 +197,113 @@ pub fn main() !void {
     var settled: u32 = 0;
     while (!window.shouldClose()) {
         if (app.wantsRepaint() or capture != null) zglfw.pollEvents() else zglfw.waitEventsTimeout(0.25);
-        if (!gctx.canRender()) continue;
-
-        const fb = window.getFramebufferSize();
-        const ws = window.getSize();
-        if (ws[0] <= 0 or ws[1] <= 0) continue;
-        const ppp = @as(f32, @floatFromInt(fb[0])) / @as(f32, @floatFromInt(ws[0]));
-
-        // Keep held state current even without events.
-        if (g_input.pointer == null) {
-            const cp = window.getCursorPos();
-            g_input.pointer = .{ .x = @floatCast(cp[0]), .y = @floatCast(cp[1]) };
-        }
-        g_input.time = zglfw.getTime();
-        app.ctx.input = g_input;
-        g_input.endFrame();
-
-        newImguiFrame(fb, ppp, g_input.pointer);
-        const screen = kit.Rect.fromMinSize(.{}, .{ .x = @floatFromInt(ws[0]), .y = @floatFromInt(ws[1]) });
-        app.update(screen, ppp);
-
-        var shoot = false;
-        if (capture) |c| {
-            settled = if (app.isLoading()) 0 else settled + 1;
-            shoot = settled >= 8 + 4 * clickCount(c.clicks);
-            if (settled >= 4) injectClick(c.clicks, settled - 4);
-        }
-
-        const encoder = gctx.device.createCommandEncoder(null);
-        defer encoder.release();
-        var off_tex: ?wgpu.Texture = null;
-        var target: wgpu.TextureView = undefined;
-        if (shoot) {
-            off_tex = gctx.device.createTexture(.{
-                .usage = .{ .render_attachment = true, .copy_src = true },
-                .size = .{ .width = @intCast(fb[0]), .height = @intCast(fb[1]), .depth_or_array_layers = 1 },
-                .format = zgpu.GraphicsContext.swapchain_format,
-            });
-            target = off_tex.?.createView(.{});
-        } else {
-            target = gctx.swapchain.getCurrentTextureView();
-        }
-        defer target.release();
-
-        app.renderVolume(encoder, target, ppp);
-        {
-            const attachments = [_]wgpu.RenderPassColorAttachment{.{ .view = target, .load_op = .load, .store_op = .store }};
-            const pass = encoder.beginRenderPass(.{ .color_attachment_count = attachments.len, .color_attachments = &attachments });
-            zgui.backend.draw(pass);
-            pass.end();
-            pass.release();
-        }
-        const cmd = encoder.finish(null);
-        defer cmd.release();
-        gctx.submit(&.{cmd});
-
-        if (shoot) {
-            const c = capture.?;
-            saveScreenshot(gpa, gctx, off_tex.?, @intCast(fb[0]), @intCast(fb[1]), c.path) catch |e| {
-                std.debug.print("screenshot failed: {s}\n", .{@errorName(e)});
-            };
-            off_tex.?.release();
-            break;
-        }
-        _ = gctx.present();
+        if (drawFrame(gpa, gctx, window, &app, capture, &settled) == .captured) break;
     }
+}
+
+pub const Fonts = struct { proportional: zgui.Font, mono: zgui.Font };
+
+/// Create the ImGui context, load the embedded fonts and start the GLFW and
+/// WebGPU backends. Undo with `zgui.backend.deinit` then `zgui.deinit`.
+pub fn initImgui(gpa: std.mem.Allocator, window: *zglfw.Window, gctx: *zgpu.GraphicsContext) Fonts {
+    zgui.init(gpa);
+    zgui.io.setIniFilename(null);
+    var cfg = zgui.FontConfig.init();
+    cfg.font_data_owned_by_atlas = false;
+    const font = zgui.io.addFontFromMemoryWithConfig(ubuntu_light, 13.5 * 1.121, cfg, null);
+    zgui.io.setDefaultFont(font);
+    var mcfg = zgui.FontConfig.init();
+    mcfg.font_data_owned_by_atlas = false;
+    const mono = zgui.io.addFontFromMemoryWithConfig(hack_regular, 11.0, mcfg, null);
+    zgui.backend.init(window, gctx.device, @intFromEnum(zgpu.GraphicsContext.swapchain_format), @intFromEnum(wgpu.TextureFormat.undef));
+    return .{ .proportional = font, .mono = mono };
+}
+
+pub fn useFonts(app: *app_mod.App, fonts: Fonts) void {
+    app.ctx.proportional.font = fonts.proportional;
+    // Hack: ascent 0.759 + descent 0.241 = 1 em; row adds the 0.164 gap.
+    app.ctx.monospace = .{ .font = fonts.mono, .em_to_px = 1.0, .row_factor = 1.164 };
+}
+
+pub const FrameResult = enum { skipped, presented, captured };
+
+/// Build the UI and render one frame (volume, then ImGui) to the swap chain.
+/// With a capture (desktop only), the frame that settles is drawn to an
+/// offscreen texture and saved instead.
+pub fn drawFrame(
+    gpa: std.mem.Allocator,
+    gctx: *zgpu.GraphicsContext,
+    window: *zglfw.Window,
+    app: *app_mod.App,
+    capture: ?Capture,
+    settled: *u32,
+) FrameResult {
+    if (!gctx.canRender()) return .skipped;
+
+    const fb = window.getFramebufferSize();
+    const ws = window.getSize();
+    if (ws[0] <= 0 or ws[1] <= 0) return .skipped;
+    const ppp = @as(f32, @floatFromInt(fb[0])) / @as(f32, @floatFromInt(ws[0]));
+
+    // Keep held state current even without events.
+    if (g_input.pointer == null) {
+        const cp = window.getCursorPos();
+        g_input.pointer = .{ .x = @floatCast(cp[0]), .y = @floatCast(cp[1]) };
+    }
+    g_input.time = zglfw.getTime();
+    app.ctx.input = g_input;
+    g_input.endFrame();
+
+    newImguiFrame(fb, ppp, g_input.pointer);
+    const screen = kit.Rect.fromMinSize(.{}, .{ .x = @floatFromInt(ws[0]), .y = @floatFromInt(ws[1]) });
+    app.update(screen, ppp);
+
+    // Captures read the frame back synchronously: desktop only.
+    var shoot = false;
+    if (!platform.is_web) if (capture) |c| {
+        settled.* = if (app.isLoading()) 0 else settled.* + 1;
+        shoot = settled.* >= 8 + 4 * clickCount(c.clicks);
+        if (settled.* >= 4) injectClick(c.clicks, settled.* - 4);
+    };
+
+    const encoder = gctx.device.createCommandEncoder(null);
+    defer encoder.release();
+    var off_tex: ?wgpu.Texture = null;
+    var target: wgpu.TextureView = undefined;
+    if (shoot) {
+        off_tex = gctx.device.createTexture(.{
+            .usage = .{ .render_attachment = true, .copy_src = true },
+            .size = .{ .width = @intCast(fb[0]), .height = @intCast(fb[1]), .depth_or_array_layers = 1 },
+            .format = zgpu.GraphicsContext.swapchain_format,
+        });
+        target = off_tex.?.createView(.{});
+    } else {
+        target = gctx.swapchain.getCurrentTextureView();
+    }
+    defer target.release();
+
+    app.renderVolume(encoder, target, ppp);
+    {
+        const attachments = [_]wgpu.RenderPassColorAttachment{.{ .view = target, .load_op = .load, .store_op = .store }};
+        const pass = encoder.beginRenderPass(.{ .color_attachment_count = attachments.len, .color_attachments = &attachments });
+        zgui.backend.draw(pass);
+        pass.end();
+        pass.release();
+    }
+    const cmd = encoder.finish(null);
+    defer cmd.release();
+    gctx.submit(&.{cmd});
+
+    if (!platform.is_web and shoot) {
+        const c = capture.?;
+        saveScreenshot(gpa, gctx, off_tex.?, @intCast(fb[0]), @intCast(fb[1]), c.path) catch |e| {
+            std.debug.print("screenshot failed: {s}\n", .{@errorName(e)});
+        };
+        off_tex.?.release();
+        return .captured;
+    }
+    _ = gctx.present();
+    return .presented;
 }
 
 extern fn ImGui_ImplWGPU_NewFrame() void;

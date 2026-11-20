@@ -107,6 +107,8 @@ pub const UiActions = struct {
     /// the platform layer, not the UI, owns dialogs).
     pick_file: bool = false,
     pick_folder: bool = false,
+    /// Browser: fetch and open the bundled sample scan.
+    load_sample: bool = false,
     upload_3d_index: ?usize = null,
     preset_changed: bool = false,
 };
@@ -150,6 +152,9 @@ pub const UiState = struct {
     load_error: ?[]u8 = null,
     /// Whether the platform can pick folders (native desktop).
     can_pick_folder: bool = true,
+    /// Running in a web page: files come from the browser's picker and a
+    /// bundled sample scan can be (re)loaded.
+    browser: bool = false,
 
     pub fn init(camera: camera_mod.Camera) UiState {
         return .{ .camera = camera };

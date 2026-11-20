@@ -206,7 +206,12 @@ fn emptyActions(ui: *Ui, state: *UiState) void {
     ui.addSpace(4);
     sidebar.loadStatus(ui, state);
     ui.layout.cross = .center;
-    const text = if (state.layout.isCompact()) "DICOS .dcs or .dcm files." else "DICOS .dcs or .dcm files, or a study folder.";
+    const text = if (state.browser)
+        "DICOS .dcs or .dcm files. Add the threat report to see detections."
+    else if (state.layout.isCompact())
+        "DICOS .dcs or .dcm files."
+    else
+        "DICOS .dcs or .dcm files, or a study folder.";
     centeredWrapped(ui, text, ui.text.small, theme.MUTED);
 }
 

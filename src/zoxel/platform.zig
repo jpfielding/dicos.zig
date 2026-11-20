@@ -1,11 +1,12 @@
 //! Platform layer: everything that differs between the native desktop build
-//! and a future wasm32-emscripten browser build lives here.
+//! and the wasm32-emscripten browser build lives here.
 //!
 //! Native: files and directories through std.fs, file/folder pickers by
 //! shelling out (`osascript` on macOS, `zenity` elsewhere), a worker thread
-//! for loading, environment variables. Emscripten: no folders, no pickers
-//! (the page hands bytes in), no threads — callers check the `has_*` flags
-//! and the loader falls back to running on the main thread.
+//! for loading, environment variables. Emscripten: no folders, no threads;
+//! the page's JavaScript (`web/shell.html`) runs the file picker and fetches
+//! the bundled sample, then hands bytes in (`web.zig`). Callers check the
+//! `has_*` flags and the loader falls back to running on the main thread.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -87,6 +88,25 @@ pub fn stem(name: []const u8) []const u8 {
 pub fn getenv(name: []const u8) ?[]const u8 {
     if (is_web) return null;
     return std.posix.getenv(name);
+}
+
+// ---------------------------------------------------------------------------
+// Browser (emscripten): the page's JavaScript does the asynchronous work
+// ---------------------------------------------------------------------------
+
+extern fn emscripten_run_script(script: [*:0]const u8) void;
+
+/// Open the browser's file picker (multiple files: a CT and its threat
+/// report together). The chosen files arrive later through `web.zig`.
+/// Called in the frame after the button's click, which is still within the
+/// browser's user-activation window.
+pub fn pickBrowserFiles() void {
+    if (is_web) emscripten_run_script("Module.zoxelPickFiles()");
+}
+
+/// Fetch the bundled sample scan; it arrives later through `web.zig`.
+pub fn loadBrowserSample() void {
+    if (is_web) emscripten_run_script("Module.zoxelLoadSample()");
 }
 
 // ---------------------------------------------------------------------------

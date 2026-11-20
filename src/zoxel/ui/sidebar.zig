@@ -61,7 +61,8 @@ fn studyCard(ui: *Ui, state: *const UiState) void {
     if (state.library.loaded_path) |path| ui.ctx.hoverText(resp, path);
 }
 
-/// "Open file…" and, where the platform can pick one, "Open folder…".
+/// "Open file…" and, where the platform can pick one, "Open folder…". In
+/// the browser, "Load sample" reopens the bundled scan instead.
 pub fn openButtons(ui: *Ui, state: *UiState, first_use: bool) void {
     const idle = state.loading_file == null;
     const compact = state.layout.isCompact();
@@ -78,6 +79,9 @@ pub fn openButtons(ui: *Ui, state: *UiState, first_use: bool) void {
     // Phone browsers cannot pick folders, so phone layouts leave it out.
     if (!compact and state.can_pick_folder) {
         if (theme.button(ui, "Open folder\u{2026}", .{ .sized = size }).clicked) state.actions.pick_folder = true;
+    }
+    if (state.browser) {
+        if (theme.button(ui, "Load sample", .{ .sized = size }).clicked) state.actions.load_sample = true;
     }
 }
 

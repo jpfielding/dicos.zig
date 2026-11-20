@@ -55,6 +55,18 @@ pub fn build(b: *std.Build) void {
     dicos_mod.addImport("jpeg2k", jpeg2k_mod);
 
     // -----------------------------------------------------------------------
+    // Browser build of zoxel:
+    //   zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseFast [-Demsdk=<dir>]
+    // writes zig-out/web/{index.html,zoxel.js,zoxel.wasm}. Zig compiles static
+    // libraries and emsdk's emcc links them; no other steps exist for this
+    // target.
+    // -----------------------------------------------------------------------
+    if (target.result.os.tag == .emscripten) {
+        buildWeb(b, target, optimize, dicos_mod);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
     // dicosctl executable
     // -----------------------------------------------------------------------
     const dicosctl_mod = b.createModule(.{
@@ -191,4 +203,77 @@ pub fn build(b: *std.Build) void {
         if (is_dicos) b.step("test-dicos", "Run only the dicos unit tests").dependOn(&run_t.step);
     }
     test_step.dependOn(tools_test_step);
+}
+
+/// Pinned emsdk release. 4.0.3 is the last one with the legacy
+/// `-sUSE_WEBGPU` bindings (webgpu.h) that zgpu and imgui_impl_wgpu target.
+/// Keep in sync with .github/workflows and .devcontainer/Dockerfile.
+const emsdk_version = "4.0.3";
+
+fn buildWeb(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    dicos_mod: *std.Build.Module,
+) void {
+    const emsdk = b.option([]const u8, "emsdk", "emsdk " ++ emsdk_version ++ " directory (default $EMSDK, then ~/.local/share/emsdk)") orelse
+        b.graph.env_map.get("EMSDK") orelse
+        b.pathJoin(&.{ b.graph.env_map.get("HOME") orelse "", ".local/share/emsdk" });
+    const emscripten_dir = b.pathJoin(&.{ emsdk, "upstream", "emscripten" });
+    // zgui's emscripten branch reads b.sysroot for <webgpu/webgpu.h>.
+    if (b.sysroot == null) b.sysroot = b.pathJoin(&.{ emscripten_dir, "cache", "sysroot" });
+    const sysroot_include: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ b.sysroot.?, "include" }) };
+
+    const zglfw = b.dependency("zglfw", .{ .target = target, .optimize = optimize });
+    const zgpu = b.dependency("zgpu", .{ .target = target, .optimize = optimize });
+    const zgui = b.dependency("zgui", .{ .target = target, .optimize = optimize, .backend = .glfw_wgpu });
+
+    const web_mod = b.createModule(.{
+        .root_source_file = b.path("src/zoxel/web.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    web_mod.addImport("dicos", dicos_mod);
+    web_mod.addImport("zglfw", zglfw.module("root"));
+    web_mod.addImport("zgpu", zgpu.module("root"));
+    web_mod.addImport("zgui", zgui.module("root"));
+    web_mod.addSystemIncludePath(sysroot_include);
+
+    const lib = b.addLibrary(.{ .name = "zoxel", .linkage = .static, .root_module = web_mod });
+    // Same ImTextureRef/ImTextureID workaround as the desktop build.
+    lib.addCSourceFile(.{ .file = b.path("src/zoxel/imgui_shim.cpp"), .flags = &.{ "-fno-sanitize=undefined", "-DIMGUI_DISABLE_OBSOLETE_FUNCTIONS" } });
+    lib.addIncludePath(b.path("deps/zgui/libs/imgui"));
+    lib.linkLibCpp();
+
+    const emcc = b.addSystemCommand(&.{b.pathJoin(&.{ emscripten_dir, "emcc" })});
+    emcc.setName("emcc");
+    emcc.addArtifactArg(lib);
+    emcc.addArtifactArg(zgui.artifact("imgui"));
+    emcc.addArgs(&.{
+        if (optimize == .Debug) "-O1" else "-O3",
+        "-sUSE_WEBGPU=1",
+        "-sUSE_GLFW=3",
+        "-sSTACK_SIZE=1MB",
+        // A CT parses into a few hundred MB of heap; grow on demand.
+        "-sALLOW_MEMORY_GROWTH=1",
+        "-sINITIAL_MEMORY=64MB",
+        "-sMAXIMUM_MEMORY=2GB",
+        "-sENVIRONMENT=web",
+        "-sEXPORTED_FUNCTIONS=_main,_zoxel_alloc,_zoxel_free,_zoxel_add_file,_zoxel_open_files,_zoxel_report_error",
+        "-sEXPORTED_RUNTIME_METHODS=HEAPU8",
+        "-sERROR_ON_UNDEFINED_SYMBOLS=1",
+    });
+    if (optimize == .Debug) emcc.addArg("-sASSERTIONS=1");
+    emcc.addArg("--shell-file");
+    emcc.addFileArg(b.path("web/shell.html"));
+    emcc.addArg("-o");
+    const out_html = emcc.addOutputFileArg("index.html");
+
+    const install = b.addInstallDirectory(.{
+        .source_dir = out_html.dirname(),
+        .install_dir = .prefix,
+        .install_subdir = "web",
+    });
+    b.getInstallStep().dependOn(&install.step);
 }
