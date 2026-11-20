@@ -9,7 +9,7 @@ RUN set -eux -o pipefail && \
     dnf install -y epel-release && \
     dnf -y update
 RUN set -eux -o pipefail && \
-    dnf install -y ca-certificates curl-minimal git git-lfs iproute jq make msitools ncurses nss-tools procps sudo wget which zsh zip && \
+    dnf install -y ca-certificates curl-minimal git git-lfs iproute jq make msitools ncurses nss-tools procps python3 sudo wget which xz zsh zip && \
     dnf install -y mesa-libGL-devel libX11-devel libXrandr-devel libXxf86dga libXxf86vm libXi-devel libXcursor-devel libXinerama-devel
 
 FROM base as user
@@ -59,6 +59,19 @@ RUN set -eux && \
     mv zig-${ZIG_ARCH}-linux-${ZIG_VERSION} ${SDK_HOME}/zig && \
     rm /tmp/zig.tar.xz
 ENV PATH ${SDK_HOME}/zig:${PATH}
+
+# emsdk for the zoxel browser build (zig build -Dtarget=wasm32-emscripten).
+# Pinned: 4.0.3 is the last release with the legacy -sUSE_WEBGPU bindings.
+# Keep in sync with emsdk_version in build.zig and .github/workflows.
+# build.zig finds it through $EMSDK.
+ENV EMSDK_VERSION "4.0.3"
+ENV EMSDK ${SDK_HOME}/emsdk
+RUN set -eux && \
+    git clone --depth 1 --branch ${EMSDK_VERSION} https://github.com/emscripten-core/emsdk.git ${EMSDK} && \
+    ${EMSDK}/emsdk install ${EMSDK_VERSION} && \
+    ${EMSDK}/emsdk activate ${EMSDK_VERSION} && \
+    ${EMSDK}/upstream/emscripten/embuilder build sysroot && \
+    rm -rf ${EMSDK}/downloads
 
 # starship — config lives outside ~/.config because that dir is bind-mounted from the host
 RUN set -eux && \
