@@ -28,6 +28,77 @@ Threat reports are found next to the opened file (or in the opened folder) when
 their file name contains `threat` (case-insensitive), as roxel does. Detections
 are listed in the study panel and outlined in both views.
 
+## Web demo
+
+A browser build (wasm32-emscripten + WebGPU) runs at
+<https://jpfielding.github.io/dicos.zig/>. It is the same interface, built from
+the same code. On first launch it opens a bundled synthetic sample: a backpack
+with a fishtank and a knife threat report. Use **Open file…** to choose your
+own `.dcs` files. Select the CT and its threat report together to see the
+threat boxes. **Load sample** reloads the bundled scan.
+
+![Zoxel in the browser](../../docs/images/zoxel-web.png)
+
+**Browser support:** WebGPU, which means a recent desktop Chrome or Edge,
+Safari 26+, or Firefox 141+ on Windows. The renderer needs no optional WebGPU
+features. Browsers without WebGPU see an explanation instead of a blank page.
+
+**Run it locally.** You need [emsdk](https://emscripten.org/docs/getting_started/downloads.html)
+**4.0.3** (the devcontainer already has it, in `$EMSDK`):
+
+```sh
+git clone --branch 4.0.3 https://github.com/emscripten-core/emsdk.git ~/.local/share/emsdk
+~/.local/share/emsdk/emsdk install 4.0.3 && ~/.local/share/emsdk/emsdk activate 4.0.3
+~/.local/share/emsdk/upstream/emscripten/embuilder build sysroot
+
+# Finds emsdk through -Demsdk=<dir>, then $EMSDK, then ~/.local/share/emsdk.
+zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseFast
+mkdir -p zig-out/web/samples/fishtank-knife
+cp testdata/backpack+purse_fishtank+goldfish_THREAT-knife_20260227-191512/{ct,tdr}.dcs \
+   zig-out/web/samples/fishtank-knife/
+python3 -m http.server -d zig-out/web 8080    # http://127.0.0.1:8080
+```
+
+On macOS, if `emsdk install` fails on the system Python, point it at a newer
+one: `EMSDK_PYTHON=$(uv python find 3.12)`.
+
+The output is `zig-out/web/{index.html,index.js,index.wasm}` and uses relative
+URLs only, so it works under a sub-path such as `/dicos.zig/`. The page comes
+from `web/shell.html`, and the entry point is `web.zig`. `main.zig` supplies
+the input, ImGui setup and frame code, which are shared with the desktop build.
+
+To check the page headlessly, `web/tools/cdp-screenshot.mjs` drives Chrome over
+the DevTools protocol. It can set the viewport and pixel ratio, drag to orbit,
+click GUI buttons, answer the file chooser and hide WebGPU:
+
+```sh
+node web/tools/cdp-screenshot.mjs http://127.0.0.1:8080/ web.png --size=1440x900 --dpr=2
+node web/tools/cdp-screenshot.mjs http://127.0.0.1:8080/ picked.png \
+  --click=115,167 --pick=ct.dcs,tdr.dcs        # "Open file…" in the sidebar
+```
+
+**Limits compared with the desktop build:**
+
+- There is no Open folder and no drag and drop. Of the files picked together,
+  the largest is the CT. Every other `.dcs`/`.dcm` file is searched for threat
+  reports, whatever its name; the desktop build looks for `threat` in the name.
+- Files are parsed on the main thread after one frame showing "Loading…", so
+  the page pauses while a scan loads. A CT takes about 140–200 MB of wasm heap.
+  The heap grows on demand up to 2 GB.
+- Touch uses Emscripten's GLFW, which turns the first finger into the mouse.
+  One-finger orbit works; pinch and two-finger gestures do not.
+- The page draws on every animation frame, even when idle. The desktop build
+  waits for input.
+- The `ZOXEL_SCREENSHOT` capture options are desktop only. Use the CDP harness
+  above instead.
+- The toolchain is frozen at **emsdk 4.0.3**. It is the last release with the
+  legacy `-sUSE_WEBGPU` bindings (the old `webgpu.h`) that zgpu and
+  `imgui_impl_wgpu` are written against. Later releases replace them with the
+  `emdawnwebgpu` port. Moving to it means porting zgpu's bindings and the ImGui
+  backend. The local zgpu patches (enum values, and using the device that the
+  page creates so ASYNCIFY is not needed) are described in
+  [`deps/zgpu/PATCHES.md`](../../deps/zgpu/PATCHES.md).
+
 ## Inspect a study
 
 The study panel sits on the left, the 3D view in the center, and the slice
@@ -172,7 +243,8 @@ actual unobscured workspace rectangle.
 
 Native-only facilities (files, directories, file dialogs, the loader thread,
 screenshots) sit behind `platform.zig`; loading works from in-memory bytes, with
-paths as thin wrappers, and runs on the main thread where threads are missing.
+paths as thin wrappers, and runs on the main thread where threads are missing
+(the browser, see [Web demo](#web-demo)).
 
 Differences from roxel, all invisible at normal viewing:
 
