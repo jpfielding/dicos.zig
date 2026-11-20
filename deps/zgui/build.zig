@@ -232,7 +232,8 @@ pub fn build(b: *std.Build) void {
                 imgui.addSystemIncludePath(.{
                     .cwd_relative = b.pathJoin(&.{ b.sysroot.?, "include" }),
                 });
-                imgui.root_module.addCMacro("IMGUI_IMPL_WEBGPU_BACKEND_WGPU", "");
+                // Emscripten's built-in webgpu.h (-sUSE_WEBGPU): imgui_impl_wgpu
+                // selects it via __EMSCRIPTEN__ and errors if a BACKEND_* macro is set.
             } else {
                 if (b.lazyDependency("zglfw", .{})) |zglfw| {
                     imgui.addIncludePath(zglfw.path("libs/glfw/include"));
@@ -241,6 +242,9 @@ pub fn build(b: *std.Build) void {
                     imgui.addIncludePath(zgpu.path("libs/dawn/include"));
                 }
                 imgui.root_module.addCMacro("IMGUI_IMPL_WEBGPU_BACKEND_DAWN_LEGACY", "");
+                // WebGPU needs no GL; without this glfw3.h pulls in <GL/gl.h>,
+                // which Linux hosts lack unless mesa dev headers are installed.
+                imgui.root_module.addCMacro("GLFW_INCLUDE_NONE", "");
             }
             imgui.addCSourceFiles(.{
                 .files = &.{

@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Keep in sync with .github/workflows/pages.yml and .devcontainer/Dockerfile.
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  test:
+    name: fmt / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Format
+        run: zig fmt --check build.zig src
+
+      # Exercises the example generator end to end (writes the gitignored
+      # testdata/synthetic/ fixture) and validates it produces a DICOS file.
+      - name: Generate synthetic fixture
+        run: |
+          mkdir -p testdata/synthetic
+          zig build gen-luggage-fishtank -- \
+            --size 64,64,48 \
+            --out testdata/synthetic/luggage_fishtank_ct.dcs
+
+      - name: Test
+        run: zig build test --summary all
+
+      - name: Viewer logic tests
+        run: zig build zoxel-test --summary all
+
+  # Keeps the browser build (zoxel on wasm32-emscripten) from rotting; the
+  # Pages workflow publishes it from main.
+  web:
+    name: web (wasm32-emscripten)
+    runs-on: ubuntu-latest
+    env:
+      # Keep in sync with .github/workflows/pages.yml and build.zig.
+      EMSDK_VERSION: "4.0.3"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Cache emsdk
+        id: emsdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/emsdk
+          key: emsdk-${{ env.EMSDK_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install emsdk
+        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${EMSDK_VERSION}" https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
+          "$HOME/emsdk/emsdk" install "${EMSDK_VERSION}"
+          "$HOME/emsdk/emsdk" activate "${EMSDK_VERSION}"
+          # Zig compiles imgui against the sysroot headers before emcc first runs.
+          "$HOME/emsdk/upstream/emscripten/embuilder" build sysroot
+
+      - name: Build
+        run: zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseFast -Demsdk="$HOME/emsdk" --summary all
+
+      - name: Check output
+        run: ls -la zig-out/web && test -s zig-out/web/index.wasm

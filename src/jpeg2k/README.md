@@ -1,17 +1,52 @@
-# jpeg2k
+# JPEG 2000 Codec
 
-Pure Zig implementation of JPEG 2000 Part-1 (ITU-T T.800 / ISO/IEC 15444-1) encoder and decoder.
+Pure Zig implementation of JPEG 2000 Part-1 (ITU-T T.800 / ISO/IEC 15444-1)
+encoder and decoder. Port of the Rust `pure_jpeg2k` crate **2.1.0**; for the
+same input and options the encoder emits byte-identical codestreams.
+
+## Conformance scope (2.x)
+
+This module emits **conformant ITU-T T.800 lossless codestreams** within an
+explicit profile. Everything legal-but-unsupported is **rejected loudly** via a
+validated support matrix rather than mis-encoded.
+
+Supported: 1 tile, 1 component (**unsigned 16-bit**), reversible 5/3 DWT, LRCP
+progression, 1 layer, `cb_style = 0`, zero grid origins, code-block exponents
+`2..=10` (sum ≤ 12). Configurable decomposition levels and code-block size.
+
+Rejected as `error.Unsupported`: multiple tiles or components, non-16-bit or
+signed precision, MCT ≠ 0, progression ≠ LRCP, layers ≠ 1, `cb_style ≠ 0`,
+transform ≠ 5/3, non-zero origins, `POC/COC/QCC/RGN/PPM/PPT/PLM/PLT`, `SOP/EPH`,
+multiple tile-parts, and geometries needing more than one precinct per
+resolution (a resolution wider or taller than 2^15).
+
+Interop is verified against **OpenJPEG** (`opj_compress`/`opj_decompress`) in
+both directions (see `tests/interop.zig`).
+
+### Legacy (1.0.0 / Go) files
+
+1.0.0 shipped a non-conformant raw-DWT format. Those files remain decodable via
+`DecodeOptions{ .legacy = LegacyPolicy }`: `decode()` uses `.auto` (decode
+standard, fall back to the legacy fingerprint: all-zero QCD exponents plus a
+`[w u16, h u16, w·h i32]` payload), and `.standard_only` / `.legacy_only` are
+available. Use `.standard_only` for untrusted, transfer-syntax-tagged data.
+
+The legacy path is compiled in by default (Rust feature `legacy-decode`). An
+application can drop it by declaring `pub const jpeg2k_legacy_decode = false;`
+in its root source file; `.auto` then behaves as `.standard_only` and
+`.legacy_only` returns `error.Unsupported`.
 
 ## Features
 
 - **Lossless compression** using 5/3 reversible discrete wavelet transform (DWT)
-- **EBCOT tier-1 block coding** with embedded truncation
-- **MQ arithmetic coder** (ITU-T T.800 Annex C)
+- **EBCOT tier-1 block coding** with the MQ arithmetic coder
+- **MQ arithmetic coder** (ITU-T T.800 Annex C, normative/OpenJPEG convention)
+- **Tier-2 packets** with tag trees and `Lblock` length signalling (T.800 B.10)
 - **Configurable decomposition levels** and code-block sizes
-- **8-bit and 16-bit** grayscale images
+- **Single-component unsigned 16-bit** grayscale images
 - **DICOS/DICOM compatible**: Transfer Syntax `1.2.840.10008.1.2.4.90`
-- **Allocator-aware**: All memory allocation goes through `std.mem.Allocator`
-- **Pure Zig**: No external codec dependencies
+- **Allocator-aware**: every allocation goes through a caller `std.mem.Allocator`
+- **Pure Zig**: no external codec dependencies
 
 ## Transfer Syntax
 
@@ -25,199 +60,130 @@ DICOM UID: `1.2.840.10008.1.2.4.90` (JPEG 2000 Lossless)
 const std = @import("std");
 const jpeg2k = @import("jpeg2k");
 
-const pixels: []const u16 = // ... row-major 16-bit pixel buffer
-const opts = jpeg2k.codestream.Jpeg2kOptions{};
-const compressed = try jpeg2k.codestream.encode(allocator, pixels, 8, 8, &opts);
-defer allocator.free(compressed);
+var pixels: [64]u16 = undefined;
+for (&pixels, 0..) |*p, i| p.* = @intCast(i * 1000);
+
+var out: std.Io.Writer.Allocating = .init(gpa);
+defer out.deinit();
+try jpeg2k.encode(gpa, &pixels, 8, 8, &out.writer); // default options
+const compressed = out.written();
 ```
 
 ### Encoding with Custom Options
 
 ```zig
-const jpeg2k = @import("jpeg2k");
-
-const opts = jpeg2k.codestream.Jpeg2kOptions{
-    .tile_width = 0,           // 0 = single tile (whole image)
+try jpeg2k.encodeWithOptions(gpa, &pixels, 8, 8, .{
+    .tile_width = 0, // 0 = single tile (whole image); non-zero is Unsupported
     .tile_height = 0,
-    .cb_width_exp = 6,         // Code-block width: 2^6 = 64
-    .cb_height_exp = 6,        // Code-block height: 2^6 = 64
-    .num_decomp_levels = 5,    // DWT decomposition levels
-};
-const compressed = try jpeg2k.codestream.encode(allocator, pixels, width, height, &opts);
-defer allocator.free(compressed);
+    .cb_width_exp = 6, // code-block width: 2^6 = 64
+    .cb_height_exp = 6, // code-block height: 2^6 = 64
+    .num_decomp_levels = 5, // DWT decomposition levels
+}, &out.writer);
 ```
+
+`encode*` writes the whole codestream to the `std.Io.Writer` but does not
+flush it; flush buffered writers yourself.
 
 ### Decoding
 
 ```zig
-const jpeg2k = @import("jpeg2k");
+var img = try jpeg2k.decode(gpa, compressed, 8, 8); // 0, 0 = trust SIZ
+defer img.deinit(gpa);
+// img.pixels: []u16 (row-major), img.width, img.height
 
-const result = try jpeg2k.codestream.decode(allocator, compressed, 8, 8);
-defer allocator.free(result[0]); // pixel data
-const pixels = result[0];
-const width = result[1];
-const height = result[2];
+var strict = try jpeg2k.decodeWithOptions(gpa, compressed, 0, 0, .{ .legacy = .standard_only });
+defer strict.deinit(gpa);
 ```
 
-## Processing Pipeline
+### Errors
 
-The encoder processes an image through these stages:
+`jpeg2k.CodecError` mirrors the Rust `CodecError`:
 
-1. **Tiling** -- Partition the image into tiles (default: single tile)
-2. **RCT** -- Reversible Color Transform (identity for single-component grayscale)
-3. **DWT** -- 5/3 reversible wavelet transform via lifting, producing LL/LH/HL/HH subbands at each decomposition level
-4. **Quantization** -- Identity (no quantization) for lossless mode
-5. **EBCOT Tier-1** -- Code each code-block independently using three coding passes (significance, refinement, cleanup) with the MQ coder
-6. **EBCOT Tier-2** -- Organize coded data into packets and layers
-7. **Codestream** -- Write markers and tile-part data
+| Zig | Rust | Meaning |
+|-----|------|---------|
+| `error.IoError` | `Io` | output writer failed, or a marker segment was truncated |
+| `error.InvalidData` | `InvalidData` | malformed codestream or out-of-range option |
+| `error.Unsupported` | `Unsupported` | legal T.800 outside the support matrix |
+| `error.DimensionMismatch` | `DimensionMismatch` | pixel count / caller dims disagree |
+| `error.OutOfMemory` | (abort) | allocation failure |
 
-### 5/3 Reversible DWT
+The set is a subset of `dicos.CodecError`, so it coerces without mapping. Zig
+errors carry no payload; the Rust message for each return site is kept as a
+comment next to it.
 
-The discrete wavelet transform uses the Le Gall 5/3 filter with the lifting scheme:
+## Supported Image Types
+
+| Pixel Type | Precision | Components | Description |
+|------------|-----------|------------|-------------|
+| `u16` | 16-bit unsigned | 1 | 16-bit grayscale (the only conformant profile) |
+
+## Architecture
 
 ```
-Forward:
-  d[n] = x[2n+1] - floor((x[2n] + x[2n+2]) / 2)       (predict)
-  s[n] = x[2n]   + floor((d[n-1] + d[n] + 2) / 4)      (update)
-
-Inverse:
-  x[2n]   = s[n] - floor((d[n-1] + d[n] + 2) / 4)      (undo update)
-  x[2n+1] = d[n] + floor((x[2n] + x[2n+2]) / 2)        (undo predict)
+jpeg2k/
+  root.zig        # Public API (encode, decode, Jpeg2kOptions, TRANSFER_SYNTAX_UID)
+  error.zig       # CodecError
+  codestream.zig  # Codestream reader/writer, support matrix, legacy policy
+  markers.zig     # JPEG 2000 marker constants and segment structures
+  bitstream.zig   # Byte-level (and bit-level) I/O utilities
+  geometry.zig    # Resolution / band / precinct / code-block geometry (B.5-B.7)
+  dwt.zig         # 5/3 reversible DWT (conformant + frozen legacy)
+  tile.zig        # Tile-component pipeline (DWT <-> tier-1 <-> tier-2)
+  ebcot.zig       # EBCOT tier-1 block coder (shared encode/decode state machine)
+  mq.zig          # MQ binary adaptive arithmetic coder
+  tagtree.zig     # Tag-tree codec (B.10.2)
+  packet.zig      # Tier-2 packet headers (B.10)
+  legacy.zig      # FROZEN 1.0.0 raw-DWT tile decoder
+  rct.zig         # Reversible Color Transform (unused: single component)
+  tests/          # mutation, legacy_fixtures, interop, parity
+  testdata/       # legacy + OpenJPEG fixtures, Rust parity table
 ```
 
-The transform is applied first to rows, then to columns, producing four subbands (LL, LH, HL, HH) at each decomposition level. The LL subband is recursively decomposed for multi-level transforms.
+### Processing Pipeline
 
-### EBCOT Block Coding
-
-Each code-block (default 64x64) in each subband is independently coded using three bit-plane coding passes:
-
-1. **Significance Propagation** -- Code bits of samples that have at least one significant neighbor
-2. **Magnitude Refinement** -- Refine previously significant samples
-3. **Cleanup** -- Code remaining samples using the MQ arithmetic coder
-
-### MQ Arithmetic Coder
-
-The MQ coder is a binary adaptive arithmetic coder specified in ITU-T T.800 Annex C. It maintains per-context probability estimates that adapt to the data being coded, providing near-optimal compression for the binary decisions in EBCOT.
+1. **DC level shift** -- unsigned 16-bit samples minus 2^15
+2. **DWT** -- 5/3 reversible lifting (columns then rows), LL/HL/LH/HH per level
+3. **Quantization** -- none (reversible); QCD carries `eps_b = 16 + log2(gain)`, `G = 2`
+4. **EBCOT Tier-1** -- each code-block coded with SPP / MRP / cleanup passes via MQ
+5. **EBCOT Tier-2** -- one LRCP packet per resolution (tag trees, pass counts, lengths)
+6. **Codestream** -- markers and a single tile-part
 
 ## JPEG 2000 Codestream Format
 
 ```
 SOC  - Start of Codestream (0xFF4F)
 SIZ  - Image and Tile Size (0xFF51)
-       Image dimensions, tile dimensions, component count, precisions
 COD  - Coding Style Default (0xFF52)
-       Progression order, decomposition levels, code-block size, transform
 QCD  - Quantization Default (0xFF5C)
-       Quantization style, step sizes per subband
 SOT  - Start of Tile-part (0xFF90)
-       Tile index, tile-part length
-SOD  - Start of Data (0xFF93)
-[tile-part coded data: packets containing EBCOT code-block bitstreams]
+SOD  - Start of Data (0xFF93; legacy files use 0xFFD3)
+[tile-part data: LRCP packets]
 EOC  - End of Codestream (0xFFD9)
 ```
 
-Multiple SOT/SOD pairs may appear for multi-tile images. Each tile-part
-contains packet data organized by progression order.
-
-## Public Types and Functions
-
-### `codestream.zig`
-
-| Symbol | Type | Description |
-|--------|------|-------------|
-| `encode` | `fn(Allocator, []const u16, u32, u32, *const Jpeg2kOptions) CodecError![]u8` | Encode 16-bit pixels to JPEG 2000 codestream |
-| `decode` | `fn(Allocator, []const u8, u32, u32) CodecError!struct{[]u16, u32, u32}` | Decode JPEG 2000 codestream to 16-bit pixels |
-| `Jpeg2kOptions` | `struct` | Encoding options (tile size, code-block size, decomposition levels) |
-| `CodecError` | `error` | `InvalidData`, `DimensionMismatch`, `OutOfMemory`, `EndOfStream`, `Unsupported` |
-
-### `Jpeg2kOptions` Fields
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `tile_width` | `u32` | `0` | Tile width (0 = single tile, whole image) |
-| `tile_height` | `u32` | `0` | Tile height (0 = single tile, whole image) |
-| `cb_width_exp` | `u8` | `6` | Code-block width exponent (2^6 = 64) |
-| `cb_height_exp` | `u8` | `6` | Code-block height exponent (2^6 = 64) |
-| `num_decomp_levels` | `u8` | `5` | Number of DWT decomposition levels |
-
-### `dwt.zig`
-
-5/3 reversible discrete wavelet transform using the lifting scheme. Forward and inverse transforms operating on i32 coefficient arrays.
-
-### `ebcot.zig`
-
-EBCOT block coding (Tier-1 and Tier-2). Significance propagation, magnitude refinement, and cleanup passes using the MQ coder.
-
-### `mq.zig`
-
-MQ binary adaptive arithmetic coder as specified in ITU-T T.800 Annex C. Maintains per-context probability estimates with the standard state transition table.
-
-### `markers.zig`
-
-JPEG 2000 marker constants and segment structures (SIZ, COD, QCD, SOT, etc.).
-
-### `tile.zig`
-
-Tile-level encoding and decoding, including DWT application, subband partitioning, and code-block iteration.
-
-### `bitstream.zig`
-
-Byte-level I/O utilities for reading and writing the codestream.
-
-### `rct.zig`
-
-Reversible Color Transform (identity for single-component grayscale).
-
-### Root (`jpeg2k`)
-
-| Symbol | Type | Description |
-|--------|------|-------------|
-| `TRANSFER_SYNTAX_UID` | `[]const u8` | `"1.2.840.10008.1.2.4.90"` |
-| `bitstream` | module | Byte-level I/O utilities |
-| `mq` | module | MQ arithmetic coder |
-| `rct` | module | Reversible Color Transform |
-| `markers` | module | Marker constants and segment structures |
-| `dwt` | module | 5/3 reversible DWT |
-| `ebcot` | module | EBCOT block coding |
-| `tile` | module | Tile-level encode/decode |
-| `codestream` | module | Codestream reader/writer, public encode/decode API |
-
-## Module Structure
-
-```
-jpeg2k/
-  root.zig          Public API, TRANSFER_SYNTAX_UID constant, module re-exports
-  codestream.zig    Codestream reader/writer, top-level encode/decode functions
-  markers.zig       JPEG 2000 marker constants and segment structures
-  bitstream.zig     Byte-level I/O utilities
-  dwt.zig           5/3 reversible discrete wavelet transform (lifting scheme)
-  tile.zig          Tile-level encoding and decoding
-  rct.zig           Reversible Color Transform (identity for grayscale)
-  mq.zig            MQ binary adaptive arithmetic coder
-  ebcot.zig         EBCOT block coding (Tier-1 and Tier-2)
-```
-
-## Tests
-
-Run the jpeg2k tests:
+## Testing
 
 ```sh
-zig build test
+zig build test                        # all modules (Debug)
+zig test src/jpeg2k/root.zig          # this module only
+zig test -OReleaseSafe src/jpeg2k/root.zig   # full 6125-case parity matrix
 ```
 
-The module includes 48 tests covering:
+All Rust unit and integration tests are ported (`proptest` cases become
+fixed-seed loops with the same case counts). `tests/parity.zig` replays a
+digest table produced by the Rust crate (`testdata/parity_rust.txt`, one line
+`w h nl cbw cbh kind len fnv1a64` per case over dims {1,2,5,13,64,130,200}²,
+levels {0,1,2,5,8}, code-blocks {(2,2),(6,6),(4,5),(10,2),(3,7)}, 5 pixel
+patterns); Debug runs every 5th case. The OpenJPEG tool tests return
+`error.SkipZigTest` when `opj_compress` / `opj_decompress` are not found.
 
-- DWT forward/inverse round-trips (1D and 2D, single and multi-level)
-- MQ coder encode/decode round-trips (single bits, sequences, multiple contexts)
-- MQ probability adaptation verification
-- EBCOT coding pass correctness (significance, refinement, cleanup)
-- Tile-level encode/decode round-trips
-- Marker reading and writing (SIZ, COD, QCD, SOT)
-- Full codestream encode/decode round-trips (small images, gradients, constant images)
-- RCT forward/inverse identity
-- Configurable decomposition levels and code-block sizes
-- Edge cases (minimum size images, maximum pixel values, single-tile vs multi-tile)
-- Error handling for malformed codestreams
+## Resource limits
+
+Decoding caps `Xsiz·Ysiz` at 2^28 samples (as the Rust crate). A *valid*
+all-zero image compresses to a few bytes, so payload size cannot bound the
+allocation: trusting SIZ (`width = height = 0`) on untrusted input can allocate
+~1.5 GiB for a maximal image. Pass the expected dimensions, or pre-check SIZ,
+when the input is hostile.
 
 ## References
 

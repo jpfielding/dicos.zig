@@ -14,12 +14,35 @@
             .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
             .hash = "zglfw-0.10.0-dev-zgVDNIG4IQBWN_sfMD-xfC9bJS2hbBN2W7jNlDLovcdC",
         },
+        // Vendored zgpu (upstream b582a62c13af1a8228f72c47ea2eaa21259760eb),
+        // patched for wasm32-emscripten (see deps/zgpu/PATCHES.md).
+        // zgpu.addLibraryPathsTo resolves the lazy Dawn prebuilts below through
+        // the root package, so the root must keep declaring them.
         .zgpu = .{
-            .url = "https://github.com/zig-gamedev/zgpu/archive/b582a62c13af1a8228f72c47ea2eaa21259760eb.tar.gz",
-            .hash = "zgpu-0.12.0-dev-nqFT5IChCACWEis11EjrBQGaA0QXEqXfsi1e6cF3_AL3",
+            .path = "deps/zgpu",
         },
         .zgui = .{
             .path = "deps/zgui",
+        },
+        .dawn_x86_64_windows_gnu = .{
+            .url = "https://github.com/michal-z/webgpu_dawn-x86_64-windows-gnu/archive/d3a68014e6b6b53fd330a0ccba99e4dcfffddae5.tar.gz",
+            .hash = "N-V-__8AAGsYnAT5RIzeAu881RveLghQ1EidqgVBVx10gVTo",
+            .lazy = true,
+        },
+        .dawn_x86_64_linux_gnu = .{
+            .url = "https://github.com/michal-z/webgpu_dawn-x86_64-linux-gnu/archive/7d70db023bf254546024629cbec5ee6113e12a42.tar.gz",
+            .hash = "N-V-__8AAK7XUQNKNRnv1J6i189jtURJKjp3HTftoyD4Y4CB",
+            .lazy = true,
+        },
+        .dawn_aarch64_linux_gnu = .{
+            .url = "https://github.com/michal-z/webgpu_dawn-aarch64-linux-gnu/archive/c1f55e740a62f6942ff046e709ecd509a005dbeb.tar.gz",
+            .hash = "N-V-__8AAJ-wTwNc0T9oSflO92iO6IxrdMeRil37UU-KQD_M",
+            .lazy = true,
+        },
+        .dawn_x86_64_macos = .{
+            .url = "https://github.com/michal-z/webgpu_dawn-x86_64-macos/archive/901716b10b31ce3e0d3fe479326b41e91d59c661.tar.gz",
+            .hash = "N-V-__8AAIz1QAKx8C8vft2YoHjGTjEAkH2QMR2UiAo8xZJ-",
+            .lazy = true,
         },
         .dawn_aarch64_macos = .{
             .url = "https://github.com/michal-z/webgpu_dawn-aarch64-macos/archive/d2360cdfff0cf4a780cb77aa47c57aca03cc6dfe.tar.gz",

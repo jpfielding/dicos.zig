@@ -63,47 +63,47 @@ DICOS defines four primary imaging modalities, each with its own SOP Class:
 | **TDR** | Threat Detection Report | `1.2.840.10008.5.1.4.1.1.501.3` |
 | **AIT** | Advanced Imaging Technology (Personnel) | `1.2.840.10008.5.1.4.1.1.501.4` |
 
+The CT SOP Class UID is available as `dicos.uid.DICOS_CT_IMAGE_STORAGE`.
+
 **CT** -- 3D volume data from baggage/cargo CT scanners. Multi-frame images with slice position and orientation metadata. Typical bit depth is 16-bit unsigned.
 
 ```zig
+const std = @import("std");
 const dicos = @import("dicos");
 
 const file = try std.fs.cwd().openFile("ct_volume.dcs", .{});
 defer file.close();
-var buf_reader = std.io.bufferedReader(file.reader());
-var ds = try dicos.reader.parse(allocator, buf_reader.reader());
+var buf: [64 * 1024]u8 = undefined;
+var fr = file.reader(&buf);
+var ds = try dicos.parse(allocator, &fr.interface);
 defer ds.deinit();
 
 std.debug.assert(std.mem.eql(u8, ds.modality(), "CT"));
-std.debug.print("Slices: {}\n", .{ds.numberOfFrames()});
-std.debug.print("Dimensions: {}x{}\n", .{ ds.columns(), ds.rows() });
+std.debug.print("Slices: {d}\n", .{ds.numberOfFrames()});
+std.debug.print("Dimensions: {?d}x{?d}\n", .{ ds.columns(), ds.rows() });
 ```
 
 **DX** -- 2D projection images from X-ray line scanners. May include multi-energy views (low/high energy) for material discrimination.
 
 ```zig
-var ds = try dicos.reader.parse(allocator, buf_reader.reader());
+var ds = try dicos.parseBytes(allocator, file_bytes);
 defer ds.deinit();
-
-std.debug.print("Image: {}x{} @ {} bits\n", .{
-    ds.columns(), ds.rows(), ds.bitsAllocated(),
-});
+std.debug.print("Image: {?d}x{?d} @ {?d} bits\n", .{ ds.columns(), ds.rows(), ds.bitsAllocated() });
 ```
 
 **TDR** -- Threat Detection Reports containing automated threat detection results. No pixel data; instead contains sequences of threat ROIs, alarm decisions, and confidence scores.
 
 ```zig
-var ds = try dicos.reader.parse(allocator, buf_reader.reader());
+var ds = try dicos.parseBytes(allocator, file_bytes);
 defer ds.deinit();
 
 if (ds.getString(dicos.tag.ALARM_DECISION)) |decision| {
     std.debug.print("Alarm: {s}\n", .{decision});
 }
-if (ds.get(dicos.tag.THREAT_ROI_SEQUENCE)) |elem| {
-    if (elem.value == .sequence) {
-        std.debug.print("Threats detected: {}\n", .{elem.value.sequence.len});
-    }
-}
+if (ds.get(dicos.tag.THREAT_ROI_SEQUENCE)) |elem| switch (elem.value) {
+    .sequence => |items| std.debug.print("Threats detected: {d}\n", .{items.len}),
+    else => {},
+};
 ```
 
 **AIT** -- Personnel screening images from full-body scanners (e.g., millimeter wave). Typically single-frame grayscale images.
@@ -117,7 +117,7 @@ The library supports all standard DICOM transfer syntaxes used in DICOS:
 | Implicit VR Little Endian | `1.2.840.10008.1.2` | No | -- |
 | Explicit VR Little Endian | `1.2.840.10008.1.2.1` | No | -- |
 | Explicit VR Little Endian Extended | `1.2.840.10008.1.2.1.64` | No | -- |
-| Explicit VR Big Endian (Retired) | `1.2.840.10008.1.2.2` | No | -- |
+| Explicit VR Big Endian (Retired) | `1.2.840.10008.1.2.2` | No | -- (rejected by the reader) |
 | RLE Lossless | `1.2.840.10008.1.2.5` | Yes | `jpegrle` |
 | JPEG Lossless (Process 14) | `1.2.840.10008.1.2.4.57` | Yes | `jpegli` |
 | JPEG Lossless First-Order (Process 14, SV1) | `1.2.840.10008.1.2.4.70` | Yes | `jpegli` |
@@ -130,281 +130,328 @@ The library supports all standard DICOM transfer syntaxes used in DICOS:
 | Deflated Explicit VR Little Endian | `1.2.840.10008.1.2.1.99` | Yes | -- |
 
 ```zig
-const dicos = @import("dicos");
+const transfer = dicos.transfer;
 
-const ts = dicos.TransferSyntax.init(dicos.transfer.JPEG_LS_LOSSLESS);
+const ts = transfer.TransferSyntax.init(transfer.JPEG_LS_LOSSLESS);
 std.debug.assert(ts.isEncapsulated());
 std.debug.assert(ts.isJpegLs());
 std.debug.assert(ts.isExplicitVr());
-std.debug.print("{s}\n", .{ts.getName()}); // "JPEG-LS Lossless"
+std.debug.print("{f}\n", .{ts}); // "JPEG-LS Lossless" (also ts.name(); ts.uid is the UID)
 ```
 
 ## Library Usage
 
-Add `dicos` as a module dependency in your `build.zig`:
+Add `dicos` as a module import in your `build.zig`:
 
 ```zig
-const dicos_mod = b.addModule("dicos", .{
-    .root_source_file = b.path("path/to/dicos/src/dicos/root.zig"),
-});
-your_module.addImport("dicos", dicos_mod);
+const dicos_mod = b.dependency("dicos_zig", .{}).module("dicos");
+exe.root_module.addImport("dicos", dicos_mod);
 ```
+
+All allocation is explicit: a `Dataset` owns its values and frees them with
+the allocator it was created with (`ds.deinit()`).
 
 ### Reading a DICOS File
 
-```zig
-const std = @import("std");
-const dicos = @import("dicos");
+`parse` reads from any `*std.Io.Reader`; `parseBytes` is a convenience for
+an in-memory file.
 
+```zig
 const file = try std.fs.cwd().openFile("scan.dcs", .{});
 defer file.close();
-var buf_reader = std.io.bufferedReader(file.reader());
-var ds = try dicos.reader.parse(allocator, buf_reader.reader());
+var buf: [64 * 1024]u8 = undefined;
+var fr = file.reader(&buf);
+var ds = try dicos.parse(allocator, &fr.interface);
 defer ds.deinit();
 
 std.debug.print("Modality: {s}\n", .{ds.modality()});
-std.debug.print("Dimensions: {}x{}\n", .{ ds.columns(), ds.rows() });
-std.debug.print("Frames: {}\n", .{ds.numberOfFrames()});
-std.debug.print("Bits Allocated: {}\n", .{ds.bitsAllocated()});
-std.debug.print("Transfer Syntax: {s}\n", .{ds.transferSyntax().getName()});
+std.debug.print("Dimensions: {?d}x{?d}\n", .{ ds.columns(), ds.rows() });
+std.debug.print("Frames: {d}\n", .{ds.numberOfFrames()});
+std.debug.print("Bits Allocated: {?d}\n", .{ds.bitsAllocated()});
+std.debug.print("Transfer Syntax: {f}\n", .{ds.transferSyntax()});
 ```
 
-### Parsing from a Byte Slice
+`rows()`, `columns()`, `bitsAllocated()` and `pixelRepresentation()` return
+`?u16` (no invented defaults); `numberOfFrames()` defaults to 1 as DICOM
+defines.
+
+### Limits, Warnings and Diagnostics
+
+| Function | Behavior |
+|----------|----------|
+| `parse(a, r)` | 1 GB per-element limit; warnings logged via `std.log` (scope `.dicos`) |
+| `parseWithLimit(a, r, max)` | custom per-element limit; warnings logged |
+| `parseWithWarnings(a, r)` | returns `ParseResult{ dataset, warnings }` |
+| `parseWithWarningsAndLimit(a, r, max)` | both |
+| `reader.parseWithOptions(a, r, .{ .max_element_bytes, .diagnostic })` | the general form |
+
+Zig errors carry no payload, so the data the Rust variants carry
+(`Truncated { offset, context }`, `UnexpectedTag { expected, got, context }`,
+...) is delivered through an optional `*dicos.Diagnostic`, which formats with
+`{f}` to the same text as the Rust `Display`:
 
 ```zig
-const data: []const u8 = // ... DICOS file bytes
-var ds = try dicos.reader.parseBytes(allocator, data);
-defer ds.deinit();
+var diag: dicos.Diagnostic = .{};
+var res = dicos.reader.parseWithOptions(allocator, &fr.interface, .{
+    .max_element_bytes = 1 << 20,
+    .diagnostic = &diag,
+}) catch |e| {
+    std.debug.print("{s}: {f}\n", .{ @errorName(e), diag }); // e.g. "Truncated: truncated at byte 133 (element tag)"
+    return e;
+};
+defer res.deinit();
+for (res.warnings) |w| std.debug.print("warning: {f}\n", .{w});
 ```
+
+`ParseWarning` is `odd_pixel_data_length`, `pixel_count_mismatch` or
+`bits_allocated_missing`. Hostile input is bounded: per-element limit, element
+bodies read incrementally (a lying length allocates no more than ~2x the
+bytes actually present before failing as `Truncated`), nesting capped at
+`reader.MAX_NESTING_DEPTH` (64), Basic Offset Table reservation capped, and
+overlapping BOT windows rejected (`InvalidFile`) rather than duplicating data.
 
 ### Accessing Data Elements
 
 ```zig
-const dicos = @import("dicos");
-
-var ds = try dicos.reader.parse(allocator, buf_reader.reader());
+var ds = try dicos.parseBytes(allocator, file_bytes);
 defer ds.deinit();
 
-// String elements
-if (ds.getString(dicos.tag.PATIENT_NAME)) |name| {
-    std.debug.print("Patient: {s}\n", .{name});
-}
-if (ds.getString(dicos.tag.MANUFACTURER)) |manufacturer| {
-    std.debug.print("Manufacturer: {s}\n", .{manufacturer});
-}
-
+// String elements (first value when multi-valued)
+if (ds.getString(dicos.tag.PATIENT_NAME)) |name| std.debug.print("Patient: {s}\n", .{name});
+// All values of a multi-valued string ("A\B" -> ["A", "B"])
+if (ds.getStrs(dicos.tag.IMAGE_TYPE)) |parts| for (parts) |p| std.debug.print("{s}\n", .{p});
 // Numeric elements
-if (ds.getU16(dicos.tag.ROWS)) |rows| {
-    std.debug.print("Rows: {}\n", .{rows});
-}
+if (ds.getU16(dicos.tag.ROWS)) |rows| std.debug.print("Rows: {d}\n", .{rows});
+if (ds.getF64(dicos.tag.RESCALE_INTERCEPT)) |b| std.debug.print("Intercept: {d}\n", .{b});
 
-// Iterate all elements
-var iter = ds.elements.iterator();
-while (iter.next()) |entry| {
-    const elem = entry.value_ptr;
-    std.debug.print("{} {s}\n", .{ elem.tag_val, elem.vr.asBytes() });
+// Iterate all elements in ascending tag order
+for (ds.iter()) |elem| {
+    std.debug.print("{f} {f}: {f}\n", .{ elem.tag, elem.vr, elem.value });
 }
 ```
 
 ### Working with Pixel Data
 
+`PixelData` is a tagged union: `.native` (decoded `u16` frames) or
+`.encapsulated` (compressed frame items plus the Basic Offset Table). Raw
+fixed-length pixel bytes are normalized to `.native` by the reader using
+Rows, Columns, NumberOfFrames and BitsAllocated (8-bit samples are one per
+byte).
+
 ```zig
-const dicos = @import("dicos");
-
-var ds = try dicos.reader.parse(allocator, buf_reader.reader());
-defer ds.deinit();
-
 if (ds.pixelData()) |pd| {
-    std.debug.print("Frames: {}\n", .{pd.numFrames()});
-    std.debug.print("Compressed: {}\n", .{pd.isCompressed()});
-
-    if (!pd.isCompressed()) {
-        // Native pixel data -- access raw u16 values
-        if (try pd.flatData(allocator)) |pixels| {
-            defer allocator.free(pixels);
-            std.debug.print("Total pixels: {}\n", .{pixels.len});
-        }
+    std.debug.print("Frames: {d}, compressed: {}\n", .{ pd.numFrames(), pd.isCompressed() });
+    if (pd.nativeFrame(0)) |frame0| std.debug.print("Frame 0 pixels: {d}\n", .{frame0.len});
+    if (try pd.flatData(allocator)) |all| {
+        defer allocator.free(all);
+        std.debug.print("Total pixels: {d}\n", .{all.len});
     }
+    if (pd.encapsulatedFrame(0)) |bitstream| std.debug.print("Item 0: {d} bytes\n", .{bitstream.len});
 }
 ```
 
 ### Building and Writing Datasets
 
 ```zig
-const dicos = @import("dicos");
-
 var ds = dicos.Dataset.init(allocator);
 defer ds.deinit();
-
 try ds.putString(dicos.tag.PATIENT_NAME, .PN, "DOE^JOHN");
 try ds.putString(dicos.tag.MODALITY, .CS, "CT");
 try ds.putU16(dicos.tag.ROWS, .US, 512);
 try ds.putU16(dicos.tag.COLUMNS, .US, 512);
 try ds.putU16(dicos.tag.BITS_ALLOCATED, .US, 16);
 
-const out_file = try std.fs.cwd().createFile("output.dcs", .{});
-defer out_file.close();
-const bytes_written = try dicos.writer.write(allocator, &ds, out_file.writer());
-std.debug.print("Wrote {} bytes\n", .{bytes_written});
+const out = try std.fs.cwd().createFile("output.dcs", .{});
+defer out.close();
+var wbuf: [64 * 1024]u8 = undefined;
+var fw = out.writer(&wbuf);
+const bytes_written = try dicos.write(&fw.interface, &ds);
+try fw.interface.flush();
 ```
+
+The writer always emits Explicit VR Little Endian with a recomputed
+(0002,0000) group length, injects a Transfer Syntax UID when absent, rewrites
+an Implicit VR Little Endian UID to Explicit (compressed UIDs are kept),
+writes native pixels according to BitsAllocated (8-bit samples must fit in a
+byte, odd lengths padded), and rebuilds the Basic Offset Table from the
+items actually written (an empty BOT stays empty). It does not allocate;
+`writer.writeToBytes(allocator, &ds, .{})` returns an owned buffer and
+`writer.writePart10(w, &ds, .{ .diagnostic = &diag })` reports validation
+details.
 
 ### Using Codecs for Compressed Pixel Data
 
 ```zig
-const dicos = @import("dicos");
+const registry = dicos.codec_registry;
 
-// Look up a codec by name
-if (dicos.codec_registry.codecByName("jpeg-ls")) |codec| {
-    std.debug.print("Codec: {s}\n", .{codec.getName()});
-    std.debug.print("TS UID: {s}\n", .{codec.getTransferSyntaxUid()});
+// Look up a codec by name or transfer syntax (by-value `?Codec`)
+if (registry.codecByName("jpeg-ls")) |codec| {
+    std.debug.print("Codec: {s} ({s})\n", .{ codec.name, codec.transfer_syntax_uid });
 }
 
-// Look up a codec by transfer syntax UID
-if (dicos.codec_registry.codecForTransferSyntax(dicos.transfer.RLE_LOSSLESS)) |codec| {
-    std.debug.print("Found codec: {s}\n", .{codec.getName()});
-}
+// Decode a compressed frame; the transfer syntax selects the codec and an
+// unknown syntax is always error.UnsupportedTransferSyntax (no sniffing).
+const pixels = try registry.decodeFrame(allocator, compressed, width, height, dicos.transfer.JPEG_2000_LOSSLESS, null);
+defer allocator.free(pixels);
 
-// Sniff a codec from compressed data magic bytes
-if (dicos.codec_registry.sniffCodec(compressed_data)) |codec| {
-    std.debug.print("Detected: {s}\n", .{codec.getName()});
-}
+// Content sniffing, when no transfer syntax is available
+const sniffed = try registry.decodeFrameSniffed(allocator, compressed, width, height, null);
+defer allocator.free(sniffed);
 
-// Decode a compressed frame
-var decoded = try codec.decode(compressed_data, width, height, allocator);
-defer decoded.deinit();
-
-// Encode a frame
-var buf = std.ArrayList(u8).init(allocator);
-defer buf.deinit();
-try codec.encode(pixel_data, width, height, buf.writer().any());
+// Encode through the Codec interface
+var img = dicos.GrayImage(u16).fromData(allocator, 512, 512, pixel_slice).?; // takes ownership
+defer img.deinit();
+var aw: std.Io.Writer.Allocating = .init(allocator);
+defer aw.deinit();
+try registry.codecByName("rle").?.encode(&img, &aw.writer, allocator);
 ```
+
+Registry encodes always use each codec's defaults so the advertised transfer
+syntax UID is truthful for the bytes produced. Registry JPEG 2000 decodes use
+`LegacyPolicy.standard_only` (transfer-syntax-tagged data is untrusted); decode
+pre-2.0 archives with `jpeg2k.decode` directly. Backend failures surface as
+`error.Backend` with the backend name and original error in a
+`CodecDiagnostic` (`codec.decodeDiag` / `encodeDiag`).
+
+## Build Options (Rust feature flags)
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-Ddicos-rle=<bool>` | true | RLE PackBits codec (`jpegrle`) in the registry |
+| `-Ddicos-jpegls=<bool>` | true | JPEG-LS codec (`jpegls`) |
+| `-Ddicos-jpegli=<bool>` | true | JPEG Lossless codec (`jpegli`) |
+| `-Ddicos-jpeg2k=<bool>` | true | JPEG 2000 codec (`jpeg2k`) |
+
+A disabled codec's module is never imported; its lookups return `null`.
 
 ## CLI Usage (dicosctl)
 
-Build the CLI:
-
 ```sh
-zig build
+zig build -Doptimize=ReleaseSafe   # installs zig-out/bin/dicosctl
 ```
+
+Output matches the Rust `dicosctl` byte for byte (JSON keys are sorted, as
+serde_json's default map does).
 
 ### dump -- Serialize metadata as JSON
 
+Pretty-printed by default; `-c`/`--compact` emits a single line.
+
 ```sh
-$ dicosctl dump scan.dcs
+$ dicosctl dump fish.dcs
 {
-  "FileMetaInformationGroupLength": {"vr": "UL", "Value": 186},
-  "TransferSyntaxUID": {"vr": "UI", "Value": "1.2.840.10008.1.2.4.80"},
-  "Modality": {"vr": "CS", "Value": "CT"},
-  "Rows": {"vr": "US", "Value": 512},
-  "Columns": {"vr": "US", "Value": 512},
-  "BitsAllocated": {"vr": "US", "Value": 16},
-  "PixelData": {"vr": "OW", "Encapsulated": true, "Frames": 300}
+  "BitsAllocated": {
+    "Value": 16,
+    "vr": "US"
+  },
+  "Columns": {
+    "Value": 64,
+    "vr": "US"
+  },
+  ...
+  "PixelData": {
+    "Encapsulated": false,
+    "Frames": 48,
+    "vr": "OW"
+  },
+  ...
 }
+```
+
+Unnamed tags are keyed as `"(GGGG,EEEE)"`, raw binary values report their
+`"Length"`, and sequences nest their items under `"Value"`. Pipe through `jq`:
+
+```sh
+dicosctl dump scan.dcs | jq '.Modality.Value'
+dicosctl dump scan.dcs | jq 'keys'
 ```
 
 ### info -- Human-readable summary
 
 ```sh
-$ dicosctl info scan.dcs
-File: scan.dcs
-Elements: 47
+$ dicosctl info fish.dcs
+File: fish.dcs
+Elements: 55
 Modality: CT
-Dimensions: 512x512
-Frames: 300
+Dimensions: 64x64
+Frames: 48
 Bits Allocated: 16
-Transfer Syntax: JPEG-LS Lossless (1.2.840.10008.1.2.4.80)
+Transfer Syntax: Explicit VR Little Endian (1.2.840.10008.1.2.1)
 SOP Class: 1.2.840.10008.5.1.4.1.1.501.1
-SOP Instance: 1.2.276.0.7230010.3.1.4.1234567890.1234.1234567890
-Manufacturer: Smiths Detection
-Model: HI-SCAN 10080 XCT
+SOP Instance: 1.2.826.0.1.3680043.8.498.999.1001
+Patient Name: UNKNOWN^OBJECT
+Series: Luggage with Fish Tank (Synthetic)
+Manufacturer: GenericVendor
+Model: DemoScanner
 ```
+
+## Synthetic Fixture (gen-luggage-fishtank)
+
+```sh
+zig build gen-luggage-fishtank -- --size 64,64,48 --out testdata/synthetic/luggage_fishtank_ct.dcs
+```
+
+Options: `--out <path>`, `--size <x,y,z>` (default 256,256,160, each >= 32),
+`--seed <u64>`, `--with-noise on|off`, `--include-threat-tags on|off`. For
+the same arguments the output is byte-identical to the Rust example.
 
 ## Public Types and Functions
 
 ### Root Exports (`dicos`)
 
-| Symbol | Type | Description |
-|--------|------|-------------|
-| `Tag` | `packed struct(u32)` | DICOM tag with group and element fields |
-| `Vr` | `enum(u16)` | Value Representation (31 variants) |
-| `TransferSyntax` | `struct` | Transfer Syntax identified by UID string |
-| `Dataset` | `struct` | Ordered collection of DICOM data elements |
-| `Element` | `struct` | Single data element (tag + VR + value) |
-| `Value` | `union(enum)` | Typed value stored in a data element |
-| `PixelData` | `struct` | Native or encapsulated pixel data |
-| `Frame` | `struct` | Single frame of pixel data |
-| `GrayImage` | `fn(T) type` | Comptime-generic row-major pixel buffer |
-| `Codec` | `struct` | Vtable interface for lossless image codecs |
-| `CodecError` | `error` | Codec operation error set |
-| `DicosError` | `error` | DICOS file operation error set |
+| Export | Kind |
+|--------|------|
+| `Dataset`, `Element`, `Value`, `PixelData` | core types (`types.zig`) |
+| `Tag`, `Vr`, `TransferSyntax` | identifiers |
+| `GrayImage(T)` | pixel buffer |
+| `Codec`, `CodecError`, `CodecDiagnostic` | codec interface |
+| `DicosError`, `Diagnostic` | file errors and their details |
+| `ParseWarning`, `ParseResult` | non-fatal parse findings |
+| `parse`, `parseWithLimit`, `parseWithWarnings`, `parseWithWarningsAndLimit`, `parseBytes` | reader entry points |
+| `write` | writer entry point |
 
 ### Submodules
 
-| Module | Description |
-|--------|-------------|
-| `tag` | Tag constants for standard DICOM/DICOS data elements (groups 0002-7FE0, 4010, 6100) |
-| `vr` | Value Representation type definitions (all 31 VRs) with encoding property queries |
-| `transfer` | Transfer Syntax UID constants and `TransferSyntax` type with property queries |
-| `types` | Core types: `Dataset`, `Element`, `Value`, `PixelData`, `Frame` |
-| `reader` | DICOS Part 10 file parser (preamble, DICM magic, meta info, dataset) |
-| `writer` | DICOS Part 10 file writer (Explicit VR Little Endian) |
-| `codec` | `Codec` vtable interface for lossless 16-bit grayscale image compression |
-| `codec_registry` | Codec lookup by name, transfer syntax UID, or magic-byte sniffing |
-| `img` | `GrayImage(T)` comptime-generic row-major pixel buffer type |
-| `err` | `CodecError` and `DicosError` error sets |
+`err`, `tag`, `vr`, `transfer`, `uid`, `img`, `types`, `reader`, `writer`,
+`codec`, `codec_registry`.
 
 ### Key `Dataset` Methods
 
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `init` | `fn(Allocator) Dataset` | Create an empty dataset |
-| `deinit` | `fn(*Dataset) void` | Free all owned memory |
-| `insert` | `fn(*Dataset, Element) !void` | Insert or replace an element |
-| `get` | `fn(*const Dataset, Tag) ?*const Element` | Look up element by tag |
-| `remove` | `fn(*Dataset, Tag) bool` | Remove element by tag |
-| `getString` | `fn(*const Dataset, Tag) ?[]const u8` | Get string value |
-| `getU16` | `fn(*const Dataset, Tag) ?u16` | Get u16 value |
-| `getU32` | `fn(*const Dataset, Tag) ?u32` | Get u32 value |
-| `getI32` | `fn(*const Dataset, Tag) ?i32` | Get i32 value |
-| `getF64` | `fn(*const Dataset, Tag) ?f64` | Get f64 value |
-| `putString` | `fn(*Dataset, Tag, Vr, []const u8) !void` | Insert string element |
-| `putU16` | `fn(*Dataset, Tag, Vr, u16) !void` | Insert u16 element |
-| `putU32` | `fn(*Dataset, Tag, Vr, u32) !void` | Insert u32 element |
-| `rows` | `fn(*const Dataset) u16` | Rows (0028,0010), default 0 |
-| `columns` | `fn(*const Dataset) u16` | Columns (0028,0011), default 0 |
-| `modality` | `fn(*const Dataset) []const u8` | Modality (0008,0060), default "" |
-| `numberOfFrames` | `fn(*const Dataset) u32` | NumberOfFrames, default 1 |
-| `bitsAllocated` | `fn(*const Dataset) u16` | BitsAllocated, default 16 |
-| `transferSyntax` | `fn(*const Dataset) TransferSyntax` | Transfer syntax from (0002,0010) |
-| `pixelData` | `fn(*const Dataset) ?*const PixelData` | Pixel data if present |
+| Method | Returns |
+|--------|---------|
+| `init(allocator)` / `deinit()` / `clone()` | lifecycle (deep copy) |
+| `insert(elem)` | replaces and frees an existing element; always takes ownership |
+| `get(tag)` / `getPtr(tag)` / `remove(tag)` / `contains(tag)` | element access (`remove` hands the element to the caller) |
+| `len()` / `isEmpty()` / `iter()` / `tags()` | size and ordered iteration |
+| `getString`, `getStrs`, `getU16`, `getU32`, `getI32`, `getF64` | typed accessors |
+| `rows`, `columns`, `bitsAllocated`, `pixelRepresentation` | `?u16` |
+| `numberOfFrames` | `u32`, default 1 |
+| `modality`, `transferSyntax`, `isEncapsulated`, `pixelData` | convenience |
+| `putString`, `putU16`, `putU32` | builders |
+| `eql(other)`, `{f}` formatting | structural equality, Rust `Display` |
 
 ## Module Structure
 
 ```
-dicos.zig/
-  build.zig              Zig build configuration (modules, executables, tests)
-  build.zig.zon          Package manifest
-  src/
-    dicos/               Core library
-      root.zig           Module root, public re-exports
-      tag.zig            ~120 tag constants (groups 0002, 0008, 0010, 0018,
-                          0020, 0028, 4010, 6100, 7FE0, FFFE)
-      vr.zig             Vr enum (31 variants), encoding queries
-      transfer.zig       TransferSyntax type, 14 UID constants
-      types.zig          Dataset, Element, Value, PixelData, Frame
-      reader.zig         Part 10 parser (implicit/explicit VR, encapsulated)
-      writer.zig         Part 10 writer (explicit VR little endian)
-      codec.zig          Codec vtable (encode, decode, getName, getTransferSyntaxUid)
-      codec_registry.zig Codec registration and lookup functions
-      img.zig            GrayImage(T) comptime-generic pixel buffer
-      error.zig          CodecError, DicosError
-    dicosctl/            CLI tool
-      main.zig           dicosctl binary (dump, info subcommands)
-    jpegrle/             RLE PackBits codec (DICOM Part 5 Annex G)
-    jpegli/              JPEG Lossless codec (ITU-T T.81 Annex H, DPCM)
-    jpegls/              JPEG-LS codec (ISO/IEC 14495-1, LOCO-I)
-    jpeg2k/              JPEG 2000 codec (ITU-T T.800, wavelet)
-    zoxel/               3D volume viewer (wgpu + zgui)
+src/
+  dicos/
+    root.zig               Module root, public re-exports
+    tag.zig                Tag type, ~190 tag constants, name lookup
+    vr.zig                 Vr enum (31 variants), encoding queries
+    transfer.zig           TransferSyntax, 14 UID constants
+    uid.zig                SOP Class UID constants
+    types.zig              Dataset, Element, Value, PixelData
+    reader.zig             Part 10 parser (implicit/explicit VR, sequences, encapsulated)
+    reader/test_util.zig   Wire-format builders for tests
+    reader/tests.zig       Reader tests
+    writer.zig             Part 10 writer (explicit VR little endian, non-allocating)
+    codec.zig              Codec vtable
+    codec_registry.zig     Adapters, lookup, sniffing, decodeFrame
+    img.zig                GrayImage(T)
+    error.zig              CodecError, DicosError, Diagnostic, CodecDiagnostic
+    tests/                 Round-trip property tests, bag_ct sample tests
+    examples/gen_luggage_fishtank.zig
+  dicosctl/main.zig        dicosctl (dump, info)
 ```
 
 ## DICOS-Specific Tags
@@ -463,22 +510,23 @@ All DICOS-specific tags are defined in the `tag` module. The primary DICOS group
 | `SERIES_ENERGY` | (6100,0030) | SeriesEnergy |
 | `SERIES_ENERGY_DESCRIPTION` | (6100,0031) | SeriesEnergyDescription |
 
+
 ## Compression Support
 
-All codec modules provide lossless 16-bit grayscale encode/decode through the `Codec` vtable:
+All codec modules provide lossless 16-bit grayscale encode/decode through the `Codec` interface:
 
-| Codec | Standard | Module | Transfer Syntax UID |
-|-------|----------|--------|---------------------|
-| RLE PackBits | DICOM Part 5 Annex G | `jpegrle` | `1.2.840.10008.1.2.5` |
-| JPEG-LS | ISO/IEC 14495-1 (LOCO-I) | `jpegls` | `1.2.840.10008.1.2.4.80` |
-| JPEG Lossless | ITU-T T.81 Annex H (DPCM) | `jpegli` | `1.2.840.10008.1.2.4.70` |
-| JPEG 2000 | ITU-T T.800 (Wavelet) | `jpeg2k` | `1.2.840.10008.1.2.4.90` |
+| Codec | Standard | Module | Build option | Transfer Syntax UID |
+|-------|----------|--------|--------------|---------------------|
+| RLE PackBits | DICOM Part 5 Annex G | `jpegrle` | `dicos-rle` | `1.2.840.10008.1.2.5` |
+| JPEG-LS | ISO/IEC 14495-1 (LOCO-I) | `jpegls` | `dicos-jpegls` | `1.2.840.10008.1.2.4.80` |
+| JPEG Lossless | ITU-T T.81 Annex H (DPCM) | `jpegli` | `dicos-jpegli` | `1.2.840.10008.1.2.4.70` |
+| JPEG 2000 | ITU-T T.800 (Wavelet) | `jpeg2k` | `dicos-jpeg2k` | `1.2.840.10008.1.2.4.90` |
 
 The codec registry provides three ways to resolve a codec:
 
-1. **By name** -- `codec_registry.codecByName("jpeg-ls")`
+1. **By name** -- `codec_registry.codecByName("jpeg-ls")` (case-insensitive aliases)
 2. **By transfer syntax UID** -- `codec_registry.codecForTransferSyntax(uid)`
-3. **By magic bytes** -- `codec_registry.sniffCodec(data)` (heuristic, checks JPEG/RLE signatures)
+3. **By signature** -- `codec_registry.sniffCodec(data)`: JPEG 2000 codestream `FF 4F`, or a bounded JPEG marker walk to the first SOF (`FF F7` JPEG-LS, `FF C3` JPEG Lossless). RLE and JP2 boxes are never sniffed.
 
 ## Value Representations
 
@@ -492,26 +540,22 @@ All 31 standard DICOM Value Representations are supported:
 
 Long-form VRs (4-byte length field): OB, OD, OF, OL, OW, SQ, UC, UN, UR, UT.
 
+
 ## Tests
 
-Run all unit tests:
-
 ```sh
-zig build test
+zig build test              # everything (dicos, codecs, dicosctl, example)
+zig build test-dicos        # dicos only
+zig build test-dicos-tools  # dicosctl JSON formatting + example round-trip
 ```
 
-The `dicos` module includes tests for:
-
-- Dataset insert, get, remove, and iteration
-- Value type conversions (u16, u32, i32, f64, string)
-- Transfer syntax property queries (explicit VR, little endian, encapsulated)
-- Tag formatting and name lookup
-- VR encoding property queries (string, binary, long-form)
-- GrayImage creation, pixel access, row access
-- Codec registry lookup (by name, transfer syntax, magic bytes)
-- Reader/writer round-trip verification
-
-Total test count across all submodules: 262 tests in 31 files.
+The dicos tests port every Rust unit test (tag, vr, transfer, img, types,
+reader, writer, codec registry), the property tests of
+`tests/roundtrip_prop.rs` (deterministic `std.Random` seeds, 100 cases per
+property), and `tests/synthetic_luggage_example.rs`. All use
+`std.testing.allocator` for leak detection. Tests that read
+`testdata/bag_ct.dcs` skip when it is absent or an un-fetched Git LFS pointer;
+`DICOS_TESTDATA=<dir>` points them elsewhere.
 
 ## References
 

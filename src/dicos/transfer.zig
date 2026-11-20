@@ -19,16 +19,21 @@ pub const RLE_LOSSLESS = "1.2.840.10008.1.2.5";
 pub const DEFLATED_EXPLICIT_VR = "1.2.840.10008.1.2.1.99";
 
 /// A DICOM Transfer Syntax identified by its UID string.
+///
+/// Borrows the UID slice; the caller keeps it alive for the lifetime of the
+/// `TransferSyntax` (Rust owns a `String`, but every in-crate use borrows a
+/// constant or a dataset value).
 pub const TransferSyntax = struct {
+    /// The UID string (Rust `uid()`).
     uid: []const u8,
 
     pub fn init(uid: []const u8) TransferSyntax {
         return .{ .uid = uid };
     }
 
-    /// Returns the UID string.
-    pub fn getUid(self: TransferSyntax) []const u8 {
-        return self.uid;
+    /// Formats as the human-readable name (Rust `Display`). Use with `{f}`.
+    pub fn format(self: TransferSyntax, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeAll(self.name());
     }
 
     /// Returns `true` if this transfer syntax uses explicit VR encoding.
@@ -74,7 +79,7 @@ pub const TransferSyntax = struct {
     }
 
     /// Returns a human-readable name for this transfer syntax.
-    pub fn getName(self: TransferSyntax) []const u8 {
+    pub fn name(self: TransferSyntax) []const u8 {
         if (std.mem.eql(u8, self.uid, IMPLICIT_VR_LITTLE_ENDIAN)) return "Implicit VR Little Endian";
         if (std.mem.eql(u8, self.uid, EXPLICIT_VR_LITTLE_ENDIAN)) return "Explicit VR Little Endian";
         if (std.mem.eql(u8, self.uid, EXPLICIT_VR_LITTLE_ENDIAN_EXT)) return "Explicit VR Little Endian Extended";
@@ -105,7 +110,7 @@ test "implicit vr little endian properties" {
     try std.testing.expect(!ts.isJpegLossless());
     try std.testing.expect(!ts.isJpeg2000());
     try std.testing.expect(!ts.isRle());
-    try std.testing.expectEqualStrings("Implicit VR Little Endian", ts.getName());
+    try std.testing.expectEqualStrings("Implicit VR Little Endian", ts.name());
 }
 
 test "explicit vr little endian properties" {
@@ -113,7 +118,7 @@ test "explicit vr little endian properties" {
     try std.testing.expect(ts.isExplicitVr());
     try std.testing.expect(ts.isLittleEndian());
     try std.testing.expect(!ts.isEncapsulated());
-    try std.testing.expectEqualStrings("Explicit VR Little Endian", ts.getName());
+    try std.testing.expectEqualStrings("Explicit VR Little Endian", ts.name());
 }
 
 test "explicit vr big endian properties" {
@@ -121,6 +126,7 @@ test "explicit vr big endian properties" {
     try std.testing.expect(ts.isExplicitVr());
     try std.testing.expect(!ts.isLittleEndian());
     try std.testing.expect(!ts.isEncapsulated());
+    try std.testing.expectEqualStrings("Explicit VR Big Endian (Retired)", ts.name());
 }
 
 test "jpeg ls lossless properties" {
@@ -132,6 +138,55 @@ test "jpeg ls lossless properties" {
     try std.testing.expect(!ts.isJpegLossless());
     try std.testing.expect(!ts.isJpeg2000());
     try std.testing.expect(!ts.isRle());
+    try std.testing.expectEqualStrings("JPEG-LS Lossless", ts.name());
+}
+
+test "jpeg ls near lossless properties" {
+    const ts = TransferSyntax.init(JPEG_LS_NEAR_LOSSLESS);
+    try std.testing.expect(ts.isJpegLs());
+    try std.testing.expect(ts.isEncapsulated());
+    try std.testing.expectEqualStrings("JPEG-LS Near-Lossless", ts.name());
+}
+
+test "jpeg lossless properties" {
+    const ts = TransferSyntax.init(JPEG_LOSSLESS_FIRST_ORDER);
+    try std.testing.expect(ts.isJpegLossless());
+    try std.testing.expect(ts.isEncapsulated());
+    try std.testing.expect(!ts.isJpegLs());
+    try std.testing.expectEqualStrings("JPEG Lossless First-Order (Process 14, SV1)", ts.name());
+}
+
+test "jpeg 2000 properties" {
+    const ts = TransferSyntax.init(JPEG_2000);
+    try std.testing.expect(ts.isJpeg2000());
+    try std.testing.expect(ts.isEncapsulated());
+}
+
+test "deflated explicit vr properties" {
+    const ts = TransferSyntax.init(DEFLATED_EXPLICIT_VR);
+    try std.testing.expect(ts.isExplicitVr());
+    try std.testing.expect(ts.isLittleEndian());
+    try std.testing.expect(ts.isEncapsulated());
+    try std.testing.expectEqualStrings("Deflated Explicit VR Little Endian", ts.name());
+}
+
+test "extended little endian properties" {
+    const ts = TransferSyntax.init(EXPLICIT_VR_LITTLE_ENDIAN_EXT);
+    try std.testing.expect(ts.isExplicitVr());
+    try std.testing.expect(ts.isLittleEndian());
+    try std.testing.expect(!ts.isEncapsulated());
+    try std.testing.expectEqualStrings("Explicit VR Little Endian Extended", ts.name());
+}
+
+test "from str" {
+    const ts = TransferSyntax.init(EXPLICIT_VR_LITTLE_ENDIAN);
+    try std.testing.expectEqualStrings(EXPLICIT_VR_LITTLE_ENDIAN, ts.uid);
+}
+
+test "display" {
+    var buf: [64]u8 = undefined;
+    const s = try std.fmt.bufPrint(&buf, "{f}", .{TransferSyntax.init(RLE_LOSSLESS)});
+    try std.testing.expectEqualStrings("RLE Lossless", s);
 }
 
 test "jpeg 2000 lossless properties" {
@@ -140,12 +195,16 @@ test "jpeg 2000 lossless properties" {
     try std.testing.expect(ts.isEncapsulated());
     try std.testing.expect(!ts.isJpegLs());
     try std.testing.expect(!ts.isJpegLossless());
+    try std.testing.expectEqualStrings("JPEG 2000 Lossless", ts.name());
 }
 
 test "rle lossless properties" {
     const ts = TransferSyntax.init(RLE_LOSSLESS);
     try std.testing.expect(ts.isRle());
     try std.testing.expect(ts.isEncapsulated());
+    try std.testing.expect(!ts.isJpegLs());
+    try std.testing.expect(!ts.isJpeg2000());
+    try std.testing.expectEqualStrings("RLE Lossless", ts.name());
 }
 
 test "all compressed syntaxes are encapsulated" {
@@ -182,5 +241,6 @@ test "uncompressed syntaxes are not encapsulated" {
 
 test "unknown transfer syntax name" {
     const ts = TransferSyntax.init("1.2.3.4.5.999");
-    try std.testing.expectEqualStrings("1.2.3.4.5.999", ts.getName());
+    try std.testing.expectEqualStrings("1.2.3.4.5.999", ts.name());
+    try std.testing.expectEqualStrings("1.2.3.4.5.999", ts.uid);
 }

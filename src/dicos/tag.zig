@@ -27,16 +27,43 @@ pub const Tag = packed struct(u32) {
         return tagNameLookup(@as(u32, @bitCast(self)));
     }
 
-    /// Format as "(GGGG,EEEE)" for display.
-    pub fn format(self: Tag, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-        try writer.print("({X:0>4},{X:0>4})", .{ self.group, self.element });
+    /// Formats as "(GGGG,EEEE)" (Rust `Display`). Use with `{f}`.
+    pub fn format(self: Tag, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("({X:0>4},{X:0>4})", .{ self.group, self.element });
     }
 
-    /// Order function for use with std.sort and TreeMap.
+    /// Returns a formatter matching Rust's `Debug`: "(GGGG,EEEE) Name" for
+    /// known tags, "(GGGG,EEEE)" otherwise. Use with `{f}`.
+    pub fn debug(self: Tag) Debug {
+        return .{ .tag = self };
+    }
+
+    pub const Debug = struct {
+        tag: Tag,
+        pub fn format(self: Debug, w: *std.Io.Writer) std.Io.Writer.Error!void {
+            const n = self.tag.name();
+            try self.tag.format(w);
+            if (n.len > 0) try w.print(" {s}", .{n});
+        }
+    };
+
+    /// Returns the tag as a sortable `u32` (`group << 16 | element`).
+    pub fn toU32(self: Tag) u32 {
+        return @bitCast(self);
+    }
+
+    pub fn eql(a: Tag, b: Tag) bool {
+        return a.toU32() == b.toU32();
+    }
+
+    /// Strict ordering by group, then element (Rust `Ord`).
+    pub fn lessThan(a: Tag, b: Tag) bool {
+        return a.toU32() < b.toU32();
+    }
+
+    /// Order function for use with `std.sort` and binary searches.
     pub fn order(a: Tag, b: Tag) std.math.Order {
-        const ai: u32 = @bitCast(a);
-        const bi: u32 = @bitCast(b);
-        return std.math.order(ai, bi);
+        return std.math.order(a.toU32(), b.toU32());
     }
 };
 
@@ -479,6 +506,29 @@ test "sequence delimiter constants" {
     try t.expectEqual(@as(u16, 0xE000), ITEM.element);
     try t.expectEqual(@as(u16, 0xE00D), ITEM_DELIMITATION_ITEM.element);
     try t.expectEqual(@as(u16, 0xE0DD), SEQUENCE_DELIMITATION_ITEM.element);
+}
+
+test "tag debug format" {
+    var buf: [64]u8 = undefined;
+    const s = try std.fmt.bufPrint(&buf, "{f}", .{PATIENT_NAME.debug()});
+    try std.testing.expect(std.mem.indexOf(u8, s, "0010") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "PatientName") != null);
+    const u = try std.fmt.bufPrint(&buf, "{f}", .{Tag.init(0x9999, 0x9999).debug()});
+    try std.testing.expectEqualStrings("(9999,9999)", u);
+}
+
+test "tag display format" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("(0028,0010)", try std.fmt.bufPrint(&buf, "{f}", .{ROWS}));
+}
+
+test "tag hash consistency" {
+    var set = std.AutoHashMap(Tag, void).init(std.testing.allocator);
+    defer set.deinit();
+    try set.put(ROWS, {});
+    try set.put(COLUMNS, {});
+    try set.put(ROWS, {});
+    try std.testing.expectEqual(@as(u32, 2), set.count());
 }
 
 test "dicos tags are in group 4010" {

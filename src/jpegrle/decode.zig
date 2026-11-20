@@ -1,42 +1,26 @@
-//! DICOM RLE decoding for 16-bit grayscale images.
+//! DICOM RLE decoding for 8/16-bit grayscale images.
 //!
-//! Parses the 64-byte RLE header, decodes each PackBits-compressed
-//! byte-plane segment, and reconstructs the 16-bit pixel buffer.
+//! Parses the 64-byte RLE header, decodes each PackBits-compressed byte-plane
+//! segment, and reconstructs the 16-bit pixel buffer.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const testing = std.testing;
 const packbits = @import("packbits.zig");
+const errors = @import("error.zig");
 const encode_mod = @import("encode.zig");
 
-const ByteList = std.array_list.AlignedManaged(u8, null);
+const CodecError = errors.CodecError;
+const Diagnostics = errors.Diagnostics;
 
 /// DICOM RLE header size in bytes.
-const header_size: usize = 64;
+const HEADER_SIZE: usize = 64;
 
-/// Errors from RLE decoding.
-pub const DecodeError = error{
-    /// The compressed data is malformed or truncated.
-    InvalidData,
-    /// The decoded pixel count does not match the expected dimensions.
-    DimensionMismatch,
-    /// The segment count or format is not supported.
-    Unsupported,
-    /// Out of memory.
-    OutOfMemory,
-};
+/// Hard cap on the number of pixels a single decode will allocate for. Guards
+/// against attacker-controlled width/height forcing an unbounded allocation
+/// before any data is read.
+const MAX_PIXELS: usize = 1 << 28;
 
-/// Decode DICOM RLE compressed data into a 16-bit grayscale pixel buffer.
-///
-/// The input `data` contains the 64-byte RLE header followed by
-/// PackBits-compressed byte-plane segments. For 16-bit images,
-/// segment 0 is the high-byte plane and segment 1 is the low-byte plane.
-///
-/// `width` and `height` must be provided since RLE streams do not
-/// encode image dimensions.
-///
-/// Returns a struct with the decoded pixels, width, and height. The caller
-/// must free `result.pixels` with the provided allocator.
+/// Result of a successful decode. Free with `deinit`.
 pub const DecodeResult = struct {
     pixels: []u16,
     width: u32,
@@ -47,103 +31,93 @@ pub const DecodeResult = struct {
     }
 };
 
-pub fn decode(allocator: Allocator, data: []const u8, width: u32, height: u32) DecodeError!DecodeResult {
-    if (data.len < header_size) {
-        return DecodeError.InvalidData;
-    }
+/// Decode DICOM RLE compressed data into a 16-bit grayscale pixel buffer.
+///
+/// The input `data` contains the 64-byte RLE header followed by PackBits-compressed
+/// byte-plane segments. With two segments, segment 0 is the high-byte plane and
+/// segment 1 the low-byte plane; one segment is 8-bit data.
+///
+/// `width` and `height` must be provided since RLE streams do not encode image
+/// dimensions. The caller owns the result.
+pub fn decode(allocator: Allocator, data: []const u8, width: u32, height: u32) CodecError!DecodeResult {
+    return decodeDiag(allocator, data, width, height, null);
+}
+
+/// Like `decode`, additionally filling `diag` (when non-null) with the details of
+/// any returned error (parameter name, truncation offset, ...).
+pub fn decodeDiag(
+    allocator: Allocator,
+    data: []const u8,
+    width: u32,
+    height: u32,
+    diag: ?*Diagnostics,
+) CodecError!DecodeResult {
+    if (data.len < HEADER_SIZE) return errors.truncated(diag, data.len, "RLE header");
 
     // Parse header
-    const num_segments = std.mem.readInt(u32, data[0..4], .little);
-    if (num_segments == 0) {
-        return DecodeError.InvalidData;
-    }
-    if (num_segments > 15) {
-        return DecodeError.InvalidData;
-    }
+    const num_segments: usize = std.mem.readInt(u32, data[0..4], .little);
+    if (num_segments == 0) return errors.invalidData(diag, "RLE: zero segments");
+    if (num_segments > 15) return errors.invalidData(diag, "RLE: invalid segment count");
 
     var offsets: [15]u32 = undefined;
-    for (0..15) |i| {
-        const start = 4 + i * 4;
-        offsets[i] = std.mem.readInt(u32, data[start..][0..4], .little);
+    for (&offsets, 0..) |*offset, i| {
+        offset.* = std.mem.readInt(u32, data[4 + i * 4 ..][0..4], .little);
     }
 
-    const num_pixels: usize = @as(usize, width) * @as(usize, height);
-
-    // Decode each segment
-    const seg_count: usize = @intCast(num_segments);
-    var segments: [15][]u8 = undefined;
-    var segments_allocated: usize = 0;
-    errdefer {
-        for (0..segments_allocated) |i| {
-            allocator.free(segments[i]);
-        }
+    const num_pixels = std.math.mul(usize, width, height) catch MAX_PIXELS + 1;
+    if (num_pixels > MAX_PIXELS) {
+        const value = std.math.mul(i64, width, height) catch std.math.maxInt(i64);
+        return errors.invalidParameter(diag, "width*height", value, "product <= 268435456 pixels (1<<28)");
     }
 
-    for (0..seg_count) |i| {
-        const start: usize = @intCast(offsets[i]);
-        const end: usize = if (i < seg_count - 1)
-            @intCast(offsets[i + 1])
-        else
-            data.len;
+    // Decode each segment. Only the first two are used; later ones are decoded
+    // for validation and released immediately to bound memory.
+    var segments: [2][]u8 = undefined;
+    var kept: usize = 0;
+    defer for (segments[0..kept]) |s| allocator.free(s);
 
-        if (start > data.len or end > data.len or start > end) {
-            return DecodeError.InvalidData;
-        }
+    for (0..num_segments) |i| {
+        const start: usize = offsets[i];
+        const end: usize = if (i < num_segments - 1) offsets[i + 1] else data.len;
 
-        const seg_data = data[start..end];
-        const decoded_seg = packbits.decodePackbits(allocator, seg_data, num_pixels) catch |err| switch (err) {
-            error.OutOfMemory => return DecodeError.OutOfMemory,
-            else => return DecodeError.InvalidData,
+        if (start > data.len or end > data.len or start > end)
+            return errors.truncated(diag, @min(start, data.len), "RLE segment offsets");
+
+        var pb_diag: packbits.PackBitsDiagnostics = .{};
+        const decoded = packbits.decodePackbits(allocator, data[start..end], num_pixels, &pb_diag) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TruncatedLiteral, error.TruncatedRun => return errors.truncated(diag, start + pb_diag.offset, "RLE PackBits segment"),
         };
 
-        if (decoded_seg.len != num_pixels) {
-            allocator.free(decoded_seg);
-            return DecodeError.DimensionMismatch;
+        if (decoded.len != num_pixels) {
+            const actual = decoded.len;
+            allocator.free(decoded);
+            return errors.dimensionMismatch(diag, num_pixels, actual);
         }
 
-        segments[i] = decoded_seg;
-        segments_allocated += 1;
+        if (i < segments.len) {
+            segments[i] = decoded;
+            kept += 1;
+        } else {
+            allocator.free(decoded);
+        }
     }
 
-    // Reconstruct the 16-bit image from byte planes
+    // Reconstruct the image from byte planes
     switch (num_segments) {
         1 => {
             // 8-bit data stored as 16-bit
-            const pixels = allocator.alloc(u16, num_pixels) catch return DecodeError.OutOfMemory;
-            for (segments[0], 0..) |b, i| {
-                pixels[i] = @as(u16, b);
-            }
-            // Free decoded segments
-            for (0..segments_allocated) |i| {
-                allocator.free(segments[i]);
-            }
-            return DecodeResult{
-                .pixels = pixels,
-                .width = width,
-                .height = height,
-            };
+            const pixels = try allocator.alloc(u16, num_pixels);
+            for (pixels, segments[0]) |*p, b| p.* = b;
+            return .{ .pixels = pixels, .width = width, .height = height };
         },
         2 => {
             // 16-bit: segment 0 = high bytes, segment 1 = low bytes
-            const high = segments[0];
-            const low = segments[1];
-            const pixels = allocator.alloc(u16, num_pixels) catch return DecodeError.OutOfMemory;
-            for (0..num_pixels) |i| {
-                pixels[i] = (@as(u16, high[i]) << 8) | @as(u16, low[i]);
-            }
-            // Free decoded segments
-            for (0..segments_allocated) |i| {
-                allocator.free(segments[i]);
-            }
-            return DecodeResult{
-                .pixels = pixels,
-                .width = width,
-                .height = height,
-            };
+            const pixels = try allocator.alloc(u16, num_pixels);
+            for (pixels, segments[0], segments[1]) |*p, hi, lo| p.* = (@as(u16, hi) << 8) | lo;
+            return .{ .pixels = pixels, .width = width, .height = height };
         },
-        else => {
-            return DecodeError.Unsupported;
-        },
+        else => return errors.unsupported(diag, "RLE: unsupported segment count (expected 1 or 2)"),
     }
 }
 
@@ -151,129 +125,131 @@ pub fn decode(allocator: Allocator, data: []const u8, width: u32, height: u32) D
 // Tests
 // ---------------------------------------------------------------------------
 
+const testing = std.testing;
+
+fn expectRoundtrip(pixels: []const u16, w: u32, h: u32) !void {
+    const buf = try encode_mod.encode(testing.allocator, pixels, w, h);
+    defer testing.allocator.free(buf);
+    const res = try decode(testing.allocator, buf, w, h);
+    defer res.deinit(testing.allocator);
+    try testing.expectEqual(w, res.width);
+    try testing.expectEqual(h, res.height);
+    try testing.expectEqualSlices(u16, pixels, res.pixels);
+}
+
+fn expectDecodeErr(expected: CodecError, data: []const u8, w: u32, h: u32, diag: ?*Diagnostics) !void {
+    if (decodeDiag(testing.allocator, data, w, h, diag)) |r| {
+        r.deinit(testing.allocator);
+        return error.TestExpectedError;
+    } else |e| try testing.expectEqual(expected, e);
+}
+
 test "decode too short" {
-    const short_data = [_]u8{0} ** 10;
-    const result = decode(testing.allocator, &short_data, 1, 1);
-    try testing.expectError(DecodeError.InvalidData, result);
+    var diag: Diagnostics = .{};
+    try expectDecodeErr(error.Truncated, &[_]u8{0} ** 10, 1, 1, &diag);
+    try testing.expectEqual(@as(usize, 10), diag.offset);
+    try testing.expectEqualStrings("RLE header", diag.context);
+}
+
+test "decode huge dims rejected not abort" {
+    // A well-formed 1-segment header, but width*height would otherwise force a
+    // multi-exabyte allocation. Must return an error, not abort.
+    var data = [_]u8{0} ** 64;
+    std.mem.writeInt(u32, data[0..4], 1, .little);
+    var diag: Diagnostics = .{};
+    try expectDecodeErr(error.InvalidParameter, &data, 0xFFFF_FFFF, 0xFFFF_FFFF, &diag);
+    try testing.expectEqualStrings("width*height", diag.parameter);
 }
 
 test "decode zero segments" {
     var data = [_]u8{0} ** 64;
-    std.mem.writeInt(u32, data[0..4], 0, .little);
-    const result = decode(testing.allocator, &data, 1, 1);
-    try testing.expectError(DecodeError.InvalidData, result);
+    try expectDecodeErr(error.InvalidData, &data, 1, 1, null);
 }
 
 test "decode too many segments" {
     var data = [_]u8{0} ** 64;
     std.mem.writeInt(u32, data[0..4], 16, .little);
-    const result = decode(testing.allocator, &data, 1, 1);
-    try testing.expectError(DecodeError.InvalidData, result);
+    try expectDecodeErr(error.InvalidData, &data, 1, 1, null);
+}
+
+test "decode unsupported segment count" {
+    // Three well-formed (empty-image) segments: valid framing, unsupported layout.
+    var data = [_]u8{0} ** 64;
+    std.mem.writeInt(u32, data[0..4], 3, .little);
+    for (0..3) |i| std.mem.writeInt(u32, data[4 + i * 4 ..][0..4], 64, .little);
+    try expectDecodeErr(error.Unsupported, &data, 0, 0, null);
+}
+
+test "decode bad segment offsets" {
+    var data = [_]u8{0} ** 64;
+    std.mem.writeInt(u32, data[0..4], 1, .little);
+    std.mem.writeInt(u32, data[4..8], 1000, .little);
+    var diag: Diagnostics = .{};
+    try expectDecodeErr(error.Truncated, &data, 1, 1, &diag);
+    try testing.expectEqual(@as(usize, 64), diag.offset);
+    try testing.expectEqualStrings("RLE segment offsets", diag.context);
+}
+
+test "decode truncated packbits segment" {
+    var data = [_]u8{0} ** 66;
+    std.mem.writeInt(u32, data[0..4], 1, .little);
+    std.mem.writeInt(u32, data[4..8], 64, .little);
+    data[64] = 0x05; // literal of 6 bytes, none provided
+    var diag: Diagnostics = .{};
+    try expectDecodeErr(error.Truncated, &data, 2, 3, &diag);
+    try testing.expectEqual(@as(usize, 65), diag.offset);
+    try testing.expectEqualStrings("RLE PackBits segment", diag.context);
 }
 
 test "roundtrip small" {
-    const original = [_]u16{ 100, 200, 300, 400, 500, 600 };
-    var buf = ByteList.init(testing.allocator);
-    defer buf.deinit();
-    try encode_mod.encode(testing.allocator, &original, 3, 2, &buf);
-
-    const result = try decode(testing.allocator, buf.items, 3, 2);
-    defer result.deinit(testing.allocator);
-    try testing.expectEqual(@as(u32, 3), result.width);
-    try testing.expectEqual(@as(u32, 2), result.height);
-    try testing.expectEqualSlices(u16, &original, result.pixels);
+    try expectRoundtrip(&.{ 100, 200, 300, 400, 500, 600 }, 3, 2);
 }
 
 test "roundtrip uniform" {
-    const original = [_]u16{0x1234} ** (50 * 50);
-    var buf = ByteList.init(testing.allocator);
-    defer buf.deinit();
-    try encode_mod.encode(testing.allocator, &original, 50, 50, &buf);
-
-    const result = try decode(testing.allocator, buf.items, 50, 50);
-    defer result.deinit(testing.allocator);
-    try testing.expectEqualSlices(u16, &original, result.pixels);
+    try expectRoundtrip(&([_]u16{0x1234} ** (50 * 50)), 50, 50);
 }
 
 test "roundtrip gradient" {
     var pixels: [256]u16 = undefined;
-    for (0..256) |i| {
-        pixels[i] = @intCast(i);
-    }
-    var buf = ByteList.init(testing.allocator);
-    defer buf.deinit();
-    try encode_mod.encode(testing.allocator, &pixels, 16, 16, &buf);
-
-    const result = try decode(testing.allocator, buf.items, 16, 16);
-    defer result.deinit(testing.allocator);
-    try testing.expectEqualSlices(u16, &pixels, result.pixels);
+    for (&pixels, 0..) |*p, i| p.* = @intCast(i);
+    try expectRoundtrip(&pixels, 16, 16);
 }
 
 test "roundtrip max values" {
-    const original = [_]u16{std.math.maxInt(u16)} ** (10 * 10);
-    var buf = ByteList.init(testing.allocator);
-    defer buf.deinit();
-    try encode_mod.encode(testing.allocator, &original, 10, 10, &buf);
-
-    const result = try decode(testing.allocator, buf.items, 10, 10);
-    defer result.deinit(testing.allocator);
-    try testing.expectEqualSlices(u16, &original, result.pixels);
+    try expectRoundtrip(&([_]u16{std.math.maxInt(u16)} ** 100), 10, 10);
 }
 
 test "roundtrip alternating" {
     var pixels: [100]u16 = undefined;
-    for (0..100) |i| {
-        pixels[i] = if (i % 2 == 0) 0x0000 else 0xFFFF;
-    }
-    var buf = ByteList.init(testing.allocator);
-    defer buf.deinit();
-    try encode_mod.encode(testing.allocator, &pixels, 10, 10, &buf);
-
-    const result = try decode(testing.allocator, buf.items, 10, 10);
-    defer result.deinit(testing.allocator);
-    try testing.expectEqualSlices(u16, &pixels, result.pixels);
+    for (&pixels, 0..) |*p, i| p.* = if (i % 2 == 0) 0x0000 else 0xFFFF;
+    try expectRoundtrip(&pixels, 10, 10);
 }
 
 test "roundtrip large image" {
     // 512x512 gradient -- realistic CT slice size
-    const size = 512 * 512;
-    const pixels = try testing.allocator.alloc(u16, size);
+    const pixels = try testing.allocator.alloc(u16, 512 * 512);
     defer testing.allocator.free(pixels);
-    for (0..size) |i| {
-        pixels[i] = @truncate(i);
-    }
-
-    var buf = ByteList.init(testing.allocator);
-    defer buf.deinit();
-    try encode_mod.encode(testing.allocator, pixels, 512, 512, &buf);
-
-    const result = try decode(testing.allocator, buf.items, 512, 512);
-    defer result.deinit(testing.allocator);
-    try testing.expectEqualSlices(u16, pixels, result.pixels);
+    for (pixels, 0..) |*p, i| p.* = @truncate(i);
+    try expectRoundtrip(pixels, 512, 512);
 }
 
 test "roundtrip odd dimensions" {
-    const size = 7 * 13;
-    var pixels: [size]u16 = undefined;
-    for (0..size) |i| {
-        pixels[i] = @truncate(i *% 137);
-    }
-    var buf = ByteList.init(testing.allocator);
-    defer buf.deinit();
-    try encode_mod.encode(testing.allocator, &pixels, 7, 13, &buf);
-
-    const result = try decode(testing.allocator, buf.items, 7, 13);
-    defer result.deinit(testing.allocator);
-    try testing.expectEqualSlices(u16, &pixels, result.pixels);
+    var pixels: [7 * 13]u16 = undefined;
+    for (&pixels, 0..) |*p, i| p.* = @truncate(i * 137);
+    try expectRoundtrip(&pixels, 7, 13);
 }
 
 test "roundtrip single pixel" {
-    const original = [_]u16{0xABCD};
-    var buf = ByteList.init(testing.allocator);
-    defer buf.deinit();
-    try encode_mod.encode(testing.allocator, &original, 1, 1, &buf);
+    try expectRoundtrip(&.{0xABCD}, 1, 1);
+}
 
-    const result = try decode(testing.allocator, buf.items, 1, 1);
-    defer result.deinit(testing.allocator);
-    try testing.expectEqualSlices(u16, &original, result.pixels);
+test "decode single segment is 8-bit" {
+    // One segment: 4 literal bytes -> 4 pixels widened to u16.
+    var data = [_]u8{0} ** 70;
+    std.mem.writeInt(u32, data[0..4], 1, .little);
+    std.mem.writeInt(u32, data[4..8], 64, .little);
+    @memcpy(data[64..69], &[_]u8{ 0x03, 1, 2, 3, 250 });
+    const res = try decode(testing.allocator, data[0..70], 2, 2);
+    defer res.deinit(testing.allocator);
+    try testing.expectEqualSlices(u16, &.{ 1, 2, 3, 250 }, res.pixels);
 }

@@ -3,7 +3,9 @@ const std = @import("std");
 /// Row-major grayscale image buffer.
 ///
 /// Stores pixel data in row-major order (left-to-right, top-to-bottom).
-/// Generic over the pixel type T.
+/// Generic over the pixel type T. The image owns `data` (allocated with
+/// `allocator`). Rust keeps the fields private behind accessors; in Zig the
+/// fields are public and the accessor-only operations are methods below.
 pub fn GrayImage(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -40,8 +42,27 @@ pub fn GrayImage(comptime T: type) type {
 
         /// Frees the pixel data.
         pub fn deinit(self: *Self) void {
-            self.allocator.free(self.data);
+            if (self.data.len > 0) self.allocator.free(self.data);
             self.data = &.{};
+        }
+
+        /// Returns a shared slice over the row-major pixel data.
+        pub fn pixels(self: *const Self) []const T {
+            return self.data;
+        }
+
+        /// Returns a mutable slice over the row-major pixel data.
+        pub fn dataMut(self: *Self) []T {
+            return self.data;
+        }
+
+        /// Releases ownership of the pixel buffer to the caller (Rust
+        /// `into_data`). The image is left empty; the caller frees the slice
+        /// with the image's allocator.
+        pub fn intoData(self: *Self) []T {
+            const d = self.data;
+            self.data = &.{};
+            return d;
         }
 
         /// Returns the number of pixels in the image.
@@ -155,3 +176,26 @@ test "num pixels" {
     defer img.deinit();
     try std.testing.expectEqual(@as(usize, 200), img.numPixels());
 }
+
+test "zero dimension image" {
+    const allocator = std.testing.allocator;
+    var img = try GrayImage(u16).init(allocator, 0, 5, 0);
+    defer img.deinit();
+    try std.testing.expectEqual(@as(usize, 0), img.numPixels());
+    try std.testing.expectEqual(@as(usize, 0), img.data.len);
+}
+
+test "into data transfers ownership" {
+    const allocator = std.testing.allocator;
+    var img = try GrayImage(u16).init(allocator, 2, 2, 7);
+    defer img.deinit();
+    img.dataMut()[3] = 9;
+    const d = img.intoData();
+    defer allocator.free(d);
+    try std.testing.expectEqualSlices(u16, &.{ 7, 7, 7, 9 }, d);
+    try std.testing.expectEqual(@as(usize, 0), img.pixels().len);
+}
+
+// Rust `pixel_out_of_bounds` is a `#[should_panic]` test; Zig cannot assert a
+// panic in-process, and the same index is bounds-checked (safety-checked
+// builds panic) by `pixel`, so it is intentionally not ported.

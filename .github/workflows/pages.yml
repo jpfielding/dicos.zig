@@ -1,0 +1,86 @@
+name: Pages
+
+# Build the zoxel browser demo (wasm32-emscripten + WebGPU) and publish it to
+# GitHub Pages at https://jpfielding.github.io/dicos.zig/.
+# One-time owner setup: Settings → Pages → Source: "GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  # Keep in sync with .github/workflows/ci.yml and .devcontainer/Dockerfile.
+  ZIG_VERSION: "0.15.2"
+  # 4.0.3 is the last emsdk with the legacy -sUSE_WEBGPU bindings zgpu and
+  # imgui_impl_wgpu target; see emsdk_version in build.zig.
+  EMSDK_VERSION: "4.0.3"
+  SAMPLE_DIR: "testdata/backpack+purse_fishtank+goldfish_THREAT-knife_20260227-191512"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Cache emsdk
+        id: emsdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/emsdk
+          key: emsdk-${{ env.EMSDK_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install emsdk
+        if: steps.emsdk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${EMSDK_VERSION}" https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
+          "$HOME/emsdk/emsdk" install "${EMSDK_VERSION}"
+          "$HOME/emsdk/emsdk" activate "${EMSDK_VERSION}"
+          # Zig compiles imgui against the sysroot headers before emcc first runs.
+          "$HOME/emsdk/upstream/emscripten/embuilder" build sysroot
+
+      - name: Build
+        run: zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseFast -Demsdk="$HOME/emsdk" --summary all
+
+      - name: Bundle sample scan
+        run: |
+          set -euo pipefail
+          mkdir -p zig-out/web/samples/fishtank-knife
+          cp "${SAMPLE_DIR}/ct.dcs" "${SAMPLE_DIR}/tdr.dcs" zig-out/web/samples/fishtank-knife/
+          # LFS pointers are ~130 bytes; a real CT is megabytes.
+          test "$(stat -c %s zig-out/web/samples/fishtank-knife/ct.dcs)" -gt 1000000
+          du -sh zig-out/web zig-out/web/*.wasm
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: zig-out/web
+
+  deploy:
+    # Deploy only from main; workflow_dispatch on another ref just builds.
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
