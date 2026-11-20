@@ -88,7 +88,7 @@ fn focusCb(_: *zglfw.Window, focused: zglfw.Bool) callconv(.c) void {
 }
 
 fn getFramebufferSize(win: *const anyopaque) [2]u32 {
-    const w: *zglfw.Window = @constCast(@ptrCast(@alignCast(win)));
+    const w: *zglfw.Window = @ptrCast(@alignCast(@constCast(win)));
     const s = w.getFramebufferSize();
     return .{ @intCast(@max(s[0], 1)), @intCast(@max(s[1], 1)) };
 }
