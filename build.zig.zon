@@ -14,9 +14,12 @@
             .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
             .hash = "zglfw-0.10.0-dev-zgVDNIG4IQBWN_sfMD-xfC9bJS2hbBN2W7jNlDLovcdC",
         },
+        // Vendored zgpu (upstream b582a62c13af1a8228f72c47ea2eaa21259760eb),
+        // patched for wasm32-emscripten (see deps/zgpu/PATCHES.md).
+        // zgpu.addLibraryPathsTo resolves the lazy Dawn prebuilts below through
+        // the root package, so the root must keep declaring them.
         .zgpu = .{
-            .url = "https://github.com/zig-gamedev/zgpu/archive/b582a62c13af1a8228f72c47ea2eaa21259760eb.tar.gz",
-            .hash = "zgpu-0.12.0-dev-nqFT5IChCACWEis11EjrBQGaA0QXEqXfsi1e6cF3_AL3",
+            .path = "deps/zgpu",
         },
         .zgui = .{
             .path = "deps/zgui",
