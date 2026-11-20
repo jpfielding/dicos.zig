@@ -97,10 +97,16 @@ pub const Vr = enum(u16) {
         return .{ @truncate(val), @truncate(val >> 8) };
     }
 
-    /// Format for display.
-    pub fn format(self: Vr, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-        const b = self.asBytes();
-        try writer.writeAll(&b);
+    /// Returns the two-character VR name (e.g. "US") as a static string.
+    pub fn name(self: Vr) []const u8 {
+        return switch (self) {
+            inline else => |v| @tagName(v),
+        };
+    }
+
+    /// Formats as the two-character VR name (Rust `Display`). Use with `{f}`.
+    pub fn format(self: Vr, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeAll(self.name());
     }
 };
 
@@ -126,6 +132,7 @@ test "binary vrs" {
 test "sequence vr" {
     try std.testing.expect(Vr.SQ.isSequence());
     try std.testing.expect(!Vr.US.isSequence());
+    try std.testing.expect(!Vr.OB.isSequence());
     try std.testing.expect(!Vr.SQ.isString());
     try std.testing.expect(!Vr.SQ.isBinary());
 }
@@ -155,15 +162,16 @@ test "fixed sizes" {
 }
 
 test "from bytes all vrs" {
-    try std.testing.expectEqual(@as(?Vr, .AE), Vr.fromBytes("AE"));
-    try std.testing.expectEqual(@as(?Vr, .US), Vr.fromBytes("US"));
-    try std.testing.expectEqual(@as(?Vr, .SQ), Vr.fromBytes("SQ"));
-    try std.testing.expectEqual(@as(?Vr, .OW), Vr.fromBytes("OW"));
-    try std.testing.expectEqual(@as(?Vr, .UT), Vr.fromBytes("UT"));
+    const names = [_]*const [2]u8{ "AE", "AS", "AT", "CS", "DA", "DS", "DT", "FL", "FD", "IS", "LO", "LT", "OB", "OD", "OF", "OL", "OW", "PN", "SH", "SL", "SQ", "SS", "ST", "TM", "UC", "UI", "UL", "UN", "UR", "US", "UT" };
+    for (names) |n| {
+        const vr = Vr.fromBytes(n) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(n, vr.name());
+    }
 }
 
 test "from bytes invalid" {
     try std.testing.expectEqual(@as(?Vr, null), Vr.fromBytes("XX"));
+    try std.testing.expectEqual(@as(?Vr, null), Vr.fromBytes("ZZ"));
     try std.testing.expectEqual(@as(?Vr, null), Vr.fromBytes("A"));
     try std.testing.expectEqual(@as(?Vr, null), Vr.fromBytes(""));
 }
@@ -175,6 +183,13 @@ test "as bytes roundtrip" {
         const back = Vr.fromBytes(&bytes);
         try std.testing.expectEqual(@as(?Vr, vr), back);
     }
+}
+
+test "display" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("US", try std.fmt.bufPrint(&buf, "{f}", .{Vr.US}));
+    try std.testing.expectEqualStrings("OB", try std.fmt.bufPrint(&buf, "{f}", .{Vr.OB}));
+    try std.testing.expectEqualStrings("SQ", Vr.SQ.name());
 }
 
 test "every vr has exactly one category" {

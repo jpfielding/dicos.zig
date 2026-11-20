@@ -1,45 +1,46 @@
+//! Codec interface for lossless image codecs used in DICOS/DICOM.
+//!
+//! Port of the Rust `Codec` trait as a by-value vtable. Implementors provide
+//! encode/decode for 16-bit grayscale frames. All DICOS codecs are lossless:
+//! decoded output must be pixel-identical to the original input.
+
 const std = @import("std");
 const img_mod = @import("img.zig");
 const err = @import("error.zig");
 
-/// Managed ArrayList(u8) used as the output buffer for codec encoding.
-pub const ByteList = std.array_list.AlignedManaged(u8, null);
+pub const GrayImage16 = img_mod.GrayImage(u16);
+pub const CodecError = err.CodecError;
+pub const CodecDiagnostic = err.CodecDiagnostic;
 
-/// Trait-like interface for lossless image codecs used in DICOS/DICOM.
-///
-/// Implementors provide encode/decode for 16-bit grayscale frames.
-/// All DICOS codecs are lossless -- decoded output must be pixel-identical
-/// to the original input.
-///
-/// Implemented as a Zig vtable (fat pointer pattern).
 pub const Codec = struct {
-    ptr: *const anyopaque,
+    /// Human-readable codec name (e.g. "RLE", "JPEG-LS"). Rust `name()`.
+    name: []const u8,
+    /// DICOM Transfer Syntax UID this codec emits. Rust `transfer_syntax_uid()`.
+    transfer_syntax_uid: []const u8,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        encode: *const fn (ctx: *const anyopaque, data: []const u16, width: u32, height: u32, out: *ByteList) err.CodecError!void,
-        decode: *const fn (ctx: *const anyopaque, data: []const u8, width: u32, height: u32, allocator: std.mem.Allocator) (err.CodecError || error{OutOfMemory})!img_mod.GrayImage(u16),
-        name: *const fn (ctx: *const anyopaque) []const u8,
-        transferSyntaxUid: *const fn (ctx: *const anyopaque) []const u8,
+        encode: *const fn (img: *const GrayImage16, w: *std.Io.Writer, allocator: std.mem.Allocator, diag: ?*CodecDiagnostic) CodecError!void,
+        decode: *const fn (data: []const u8, width: u32, height: u32, allocator: std.mem.Allocator, diag: ?*CodecDiagnostic) CodecError!GrayImage16,
     };
 
-    /// Encode a 16-bit grayscale image to the codec's compressed format.
-    pub fn encode(self: Codec, data: []const u16, width: u32, height: u32, out: *ByteList) err.CodecError!void {
-        return self.vtable.encode(self.ptr, data, width, height, out);
+    /// Encodes a 16-bit grayscale image, writing the compressed bitstream to `w`.
+    pub fn encode(self: Codec, img: *const GrayImage16, w: *std.Io.Writer, allocator: std.mem.Allocator) CodecError!void {
+        return self.vtable.encode(img, w, allocator, null);
     }
 
-    /// Decode compressed data back into a 16-bit grayscale image.
-    pub fn decode(self: Codec, data: []const u8, width: u32, height: u32, allocator: std.mem.Allocator) !img_mod.GrayImage(u16) {
-        return self.vtable.decode(self.ptr, data, width, height, allocator);
+    /// `encode` with a diagnostic out-param (backend name + original error).
+    pub fn encodeDiag(self: Codec, img: *const GrayImage16, w: *std.Io.Writer, allocator: std.mem.Allocator, diag: ?*CodecDiagnostic) CodecError!void {
+        return self.vtable.encode(img, w, allocator, diag);
     }
 
-    /// Human-readable codec name.
-    pub fn getName(self: Codec) []const u8 {
-        return self.vtable.name(self.ptr);
+    /// Decodes compressed data into a 16-bit grayscale image owned by `allocator`.
+    pub fn decode(self: Codec, data: []const u8, width: u32, height: u32, allocator: std.mem.Allocator) CodecError!GrayImage16 {
+        return self.vtable.decode(data, width, height, allocator, null);
     }
 
-    /// DICOM Transfer Syntax UID for this codec.
-    pub fn getTransferSyntaxUid(self: Codec) []const u8 {
-        return self.vtable.transferSyntaxUid(self.ptr);
+    /// `decode` with a diagnostic out-param.
+    pub fn decodeDiag(self: Codec, data: []const u8, width: u32, height: u32, allocator: std.mem.Allocator, diag: ?*CodecDiagnostic) CodecError!GrayImage16 {
+        return self.vtable.decode(data, width, height, allocator, diag);
     }
 };

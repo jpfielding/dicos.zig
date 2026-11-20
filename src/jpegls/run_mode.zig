@@ -1,238 +1,258 @@
-//! Run-length mode for JPEG-LS.
+//! T.87 run mode and shared regular-mode sample arithmetic.
 //!
-//! When all three local gradients are zero (D1 == D2 == D3 == 0) the codec
-//! enters run mode, efficiently coding long runs of identical pixel values.
+//! Run mode is entered from the regular scan loop whenever all three local
+//! gradients are within `NEAR` (T.87 A.7). This module holds:
+//! - the run-length coding (A.7.1) and run-interruption coding (A.7.2), wired
+//!   into both scan loops via `encodeRun` / `decodeRun`;
+//! - the shared error mapping (A.5.2), near-lossless quantization/modulo
+//!   (A.4.4/A.4.5), and reconstruction (A.4.6) helpers used by regular mode
+//!   too, so the encoder and decoder cannot drift.
 //!
-//! Reference: ISO/IEC 14495-1, Section A.7.
+//! # Line buffers
+//!
+//! `cur` and `prev` are `width + 2` element `i32` buffers holding reconstructed
+//! samples with a one-slot offset: logical sample `x` lives at index `x + 1`.
+//! Logical index `-1` is slot `0` (the left border) and logical index `width`
+//! is slot `width + 1` (the right border). This realizes the T.87 A.2.1 edge
+//! rules: `Ra(0,y) = Rb`, `Rc(0,y)` retains the prior line's seed, and
+//! `Rd(width-1,y) = Rb`.
 
 const std = @import("std");
 const bitstream = @import("bitstream.zig");
-const ctx_mod = @import("context.zig");
-const CodecError = bitstream.CodecError;
+const context = @import("context.zig");
+const predictor = @import("predictor.zig");
+
 const BitReader = bitstream.BitReader;
 const BitWriter = bitstream.BitWriter;
-const ContextModel = ctx_mod.ContextModel;
+const ContextModel = context.ContextModel;
+const clamp = predictor.clamp;
+const iabs = predictor.iabs;
+
+/// Run-interruption context base index (T.87: contexts 365/366).
+const RUN_CTX_BASE = context.RUN_CTX_BASE;
 
 // ---------------------------------------------------------------------------
-// Encoder
+// Shared sample arithmetic (regular + run mode)
 // ---------------------------------------------------------------------------
 
-/// Encode a run-mode segment starting at column `x` in the current line.
+/// Map a signed error to a non-negative code (T.87 A.5.2).
 ///
-/// On return, `x.*` is updated to point past the last encoded pixel.
+/// `correction` is `0` normally or `-1` (all-ones) when the `k == 0 && NEAR == 0`
+/// bias-flip case applies; the XOR realizes both the flip and its inverse.
+pub inline fn mapError(err_val: i32, correction: i32) u32 {
+    const v = correction ^ err_val;
+    return if (v >= 0) @intCast(2 * v) else @intCast(-2 * v - 1);
+}
+
+/// Inverse of `mapError` (T.87 A.5.2).
+pub inline fn unmapError(mapped: u32, correction: i32) i32 {
+    const m: i32 = @bitCast(mapped);
+    const v = (m >> 1) ^ -(m & 1);
+    return correction ^ v;
+}
+
+/// Near-lossless error quantization (T.87 A.4.4). Identity when `near == 0`.
+pub inline fn quantize(e: i32, near: i32) i32 {
+    if (near == 0) return e;
+    if (e >= 0) return @divTrunc(e + near, 2 * near + 1);
+    return -@divTrunc(near - e, 2 * near + 1);
+}
+
+/// Modulo reduction of the (quantized) error into the coding range (A.4.5).
+pub inline fn moduloRange(e_in: i32, range: i32) i32 {
+    var e = e_in;
+    if (e < 0) e += range;
+    if (e >= @divTrunc(range + 1, 2)) e -= range;
+    return e;
+}
+
+/// Reject a decoded error value no conformant encoder can produce.
+///
+/// The encoder reduces every error modulo RANGE (A.4.5), so `|Errval| <=
+/// RANGE/2`. A larger value can only come from a corrupt Golomb code; left
+/// unchecked it inflates the context's A accumulator, which raises k, which
+/// lets the next code decode larger still, until A overflows `i32`. Within
+/// the bound A stays below `RESET * RANGE/2 <= 65535 * 32768 < i32::MAX`.
+pub inline fn checkErrval(err: i32, range: i32) error{InvalidData}!void {
+    if (@abs(err) > @as(u32, @intCast(@divTrunc(range, 2)))) return error.InvalidData;
+}
+
+/// Reconstruct a sample value, folding it back into `[0, max_val]` (A.4.6).
+pub inline fn fixReconstructed(value: i32, near: i32, range: i32, max_val: i32) i32 {
+    var v = value;
+    if (v < -near) {
+        v += range * (2 * near + 1);
+    } else if (v > max_val + near) {
+        v -= range * (2 * near + 1);
+    }
+    return clamp(v, 0, max_val);
+}
+
+// ---------------------------------------------------------------------------
+// Run-length coding (T.87 A.7.1)
+// ---------------------------------------------------------------------------
+
+inline fn runBlock(ctx: *const ContextModel) usize {
+    return @as(usize, 1) << @intCast(ctx.j[ctx.run_index]);
+}
+
+/// Emit the run-length code for a run of `run_length` samples (A.7.1.2).
+fn encodeRunPixels(bw: *BitWriter, ctx: *ContextModel, run_length_in: usize, end_of_line: bool) bitstream.WriteError!void {
+    var run_length = run_length_in;
+    while (run_length >= runBlock(ctx)) {
+        try bw.writeBit(1);
+        run_length -= runBlock(ctx);
+        ctx.incrementRunIndex();
+    }
+    if (end_of_line) {
+        // A.15 end-of-line rule: a residual run emits a single 1-bit and does
+        // NOT advance RUNindex.
+        if (run_length != 0) try bw.writeBit(1);
+    } else {
+        try bw.writeBit(0);
+        const jbits = ctx.j[ctx.run_index];
+        if (jbits > 0) try bw.writeBits(@intCast(run_length), jbits);
+    }
+}
+
+/// Decode a run-length code, returning the number of run samples (A.7.1.2).
+fn decodeRunPixels(br: *BitReader, ctx: *ContextModel, pixel_count: usize) bitstream.ReadError!usize {
+    var index: usize = 0;
+    while ((try br.readBit()) == 1) {
+        const block = runBlock(ctx);
+        const count = @min(block, pixel_count - index);
+        index += count;
+        if (count == block) ctx.incrementRunIndex();
+        if (index == pixel_count) return index;
+    }
+    const jbits = ctx.j[ctx.run_index];
+    if (jbits > 0) index += try br.readBits(jbits);
+    // "run length exceeds line width"
+    if (index > pixel_count) return error.InvalidData;
+    return index;
+}
+
+// ---------------------------------------------------------------------------
+// Run-interruption coding (T.87 A.7.2, code segments A.19-A.23)
+// ---------------------------------------------------------------------------
+
+const InterruptionParams = struct { ri_type: usize, px: i32, sign: i32 };
+
+/// Select the run-interruption parameters (T.87 A.7.2): `(RItype, Px, sign)`.
+inline fn interruptionParams(ra: i32, rb: i32, near: i32) InterruptionParams {
+    if (iabs(ra - rb) <= near) return .{ .ri_type = 1, .px = ra, .sign = 1 };
+    return .{ .ri_type = 0, .px = rb, .sign = if (rb > ra) 1 else -1 };
+}
+
+/// Run-interruption error-mapping predicate `map` (T.87 code segment A.21).
+inline fn runMap(err: i32, k: i32, nn: i32, n: i32) bool {
+    return (k == 0 and err > 0 and 2 * nn < n) or (err < 0 and 2 * nn >= n) or (err < 0 and k != 0);
+}
+
+/// Encode one run-interruption sample (A.7.2); returns the reconstructed value.
+fn encodeRunInterruption(bw: *BitWriter, ctx: *ContextModel, ix: i32, ra: i32, rb: i32) bitstream.WriteError!i32 {
+    const near = ctx.near;
+    const p = interruptionParams(ra, rb, near);
+    const ctx_idx = RUN_CTX_BASE + p.ri_type;
+
+    const err_q = moduloRange(quantize((ix - p.px) * p.sign, near), ctx.range);
+
+    const k = ctx.computeKRun(p.ri_type);
+    const map = runMap(err_q, k, ctx.nn[p.ri_type], ctx.n[ctx_idx]);
+    const e_mapped: u32 = @intCast(2 * iabs(err_q) - @as(i32, @intCast(p.ri_type)) - @intFromBool(map));
+
+    const glimit = ctx.limit - ctx.j[ctx.run_index] - 1;
+    try bw.writeLimitedGolomb(k, e_mapped, glimit, ctx.qbpp);
+    ctx.updateRunStats(p.ri_type, e_mapped, err_q < 0);
+
+    return fixReconstructed(p.px + p.sign * err_q * (2 * near + 1), near, ctx.range, ctx.max_val);
+}
+
+/// Decode one run-interruption sample (A.7.2); returns the reconstructed value.
+fn decodeRunInterruption(br: *BitReader, ctx: *ContextModel, ra: i32, rb: i32) bitstream.ReadError!i32 {
+    const near = ctx.near;
+    const p = interruptionParams(ra, rb, near);
+    const ctx_idx = RUN_CTX_BASE + p.ri_type;
+
+    const k = ctx.computeKRun(p.ri_type);
+    const glimit = ctx.limit - ctx.j[ctx.run_index] - 1;
+    const e_mapped = try br.readLimitedGolomb(k, glimit, ctx.qbpp);
+
+    // temp = e_mapped + RItype = 2*|err| - map, so its parity is `map` and
+    // ceil(temp/2) is |err| (A.22). The sign is recovered from the same
+    // predicate the encoder used: for +|err| the encoder's `map` is
+    // `k==0 && 2*Nn < N`; the negative branch is its exact complement.
+    // Computed in i64 so a corrupt (huge) code cannot overflow before the
+    // range check rejects it.
+    const temp: i64 = @as(i64, e_mapped) + @as(i64, @intCast(p.ri_type));
+    const abs_e: i64 = (temp + (temp & 1)) >> 1;
+    const map_positive = k == 0 and 2 * ctx.nn[p.ri_type] < ctx.n[ctx_idx];
+    const err_wide: i64 = if ((temp & 1) == @intFromBool(map_positive)) abs_e else -abs_e;
+
+    // Also bounds e_mapped (<= 2*|err|) before it reaches the run-context A.
+    if (err_wide > @divTrunc(ctx.range, 2) or err_wide < -@divTrunc(ctx.range, 2)) return error.InvalidData;
+    const err_q: i32 = @intCast(err_wide);
+    ctx.updateRunStats(p.ri_type, e_mapped, err_q < 0);
+
+    return fixReconstructed(p.px + p.sign * err_q * (2 * near + 1), near, ctx.range, ctx.max_val);
+}
+
+// ---------------------------------------------------------------------------
+// Run mode entry points (called from the scan loops)
+// ---------------------------------------------------------------------------
+
+/// Encode a run starting at logical sample `start`; returns the next sample.
+///
+/// `src` is the source row (length `width`); `cur`/`prev` are the offset-1
+/// reconstructed line buffers described in the module docs.
 pub fn encodeRun(
     bw: *BitWriter,
     ctx: *ContextModel,
-    curr_line: []const i32,
-    x: *usize,
+    src: []const i32,
+    cur: []i32,
+    prev: []const i32,
+    start: usize,
     width: usize,
-    ra: i32,
-    rb: i32,
-) CodecError!void {
-    const max_val = ctx.max_val;
+) bitstream.WriteError!usize {
+    const near = ctx.near;
+    const ra = cur[start]; // logical sample start-1 (border at start==0)
 
-    // 1. Measure the run of pixels equal to Ra starting at *x.
-    const start = x.*;
-    while (x.* < width and curr_line[x.*] == ra) {
-        x.* += 1;
+    var run_length: usize = 0;
+    while (start + run_length < width and iabs(src[start + run_length] - ra) <= near) {
+        cur[start + run_length + 1] = ra;
+        run_length += 1;
     }
-    var run_length = x.* - start;
+    const end = start + run_length;
+    const end_of_line = end == width;
+    try encodeRunPixels(bw, ctx, run_length, end_of_line);
+    if (end_of_line) return end;
 
-    // 2. Encode the run using the J table.
-    while (true) {
-        const j: u5 = @intCast(ctx.j[ctx.run_index]);
-        const limit: usize = @as(usize, 1) << j;
-
-        if (run_length >= limit) {
-            // Full segment -- write a 1-bit.
-            try bw.writeBit(1);
-            run_length -= limit;
-            if (ctx.run_index < 31) {
-                ctx.run_index += 1;
-            }
-
-            // If the run consumed exactly to the end of the line, we are
-            // done. No trailing 0-bit or remainder is written in this
-            // case (ISO 14495-1 A.7.1.1).
-            if (run_length == 0 and x.* >= width) {
-                return;
-            }
-        } else {
-            // Partial segment -- write a 0-bit, then the remainder in j bits.
-            try bw.writeBit(0);
-            if (j > 0) {
-                try bw.writeBits(@intCast(run_length), @as(i32, j));
-            }
-            if (ctx.run_index > 0) {
-                ctx.run_index -= 1;
-            }
-
-            // If we consumed the entire line, we are done.
-            if (x.* >= width) {
-                return;
-            }
-
-            // 3. Encode the interruption sample.
-            const ix = curr_line[x.*];
-            const pred = runInterruptionPrediction(ra, rb);
-            const px = pred[0];
-            const sign = pred[1];
-
-            var err_val = ix - px;
-            if (sign == -1) {
-                err_val = -err_val;
-            }
-
-            // Modulo reduction.
-            const range_val = max_val + 1;
-            if (err_val < -@divTrunc(range_val, 2)) {
-                err_val += range_val;
-            }
-            if (err_val > @divTrunc(range_val, 2)) {
-                err_val -= range_val;
-            }
-
-            // Context for interruption: Q = 365 if Ra == Rb, else 366.
-            const q: usize = if (ra == rb) 365 else 366;
-
-            // Map error to non-negative value.
-            const mapped: u32 = if (err_val >= 0)
-                @intCast(2 * err_val)
-            else
-                @intCast(-2 * err_val - 1);
-
-            const k = ctx.computeK(q);
-            try bw.writeGolomb(k, mapped);
-            ctx.updateStats(q, err_val);
-
-            x.* += 1;
-            return;
-        }
-    }
+    const rb = prev[end + 1];
+    cur[end + 1] = try encodeRunInterruption(bw, ctx, src[end], ra, rb);
+    ctx.decrementRunIndex();
+    return end + 1;
 }
 
-// ---------------------------------------------------------------------------
-// Decoder
-// ---------------------------------------------------------------------------
-
-/// Decode a run-mode segment, writing pixels into `curr_line` starting at `*x`.
-///
-/// On return, `x.*` is updated to point past the last decoded pixel.
+/// Decode a run starting at logical sample `start`; returns the next sample.
 pub fn decodeRun(
     br: *BitReader,
     ctx: *ContextModel,
-    curr_line: []i32,
-    x: *usize,
+    cur: []i32,
+    prev: []const i32,
+    start: usize,
     width: usize,
-    ra: i32,
-    rb: i32,
-) CodecError!void {
-    const max_val = ctx.max_val;
+) bitstream.ReadError!usize {
+    const ra = cur[start];
 
-    while (true) {
-        const b = try br.readBit();
+    const run_length = try decodeRunPixels(br, ctx, width - start);
+    @memset(cur[start + 1 .. start + run_length + 1], ra);
+    const end = start + run_length;
+    if (end == width) return end;
 
-        if (b == 1) {
-            // Full segment of 2^J[RunIndex] pixels all equal to Ra.
-            const j: u5 = @intCast(ctx.j[ctx.run_index]);
-            var run_length: usize = @as(usize, 1) << j;
-
-            const remaining = width - x.*;
-            if (run_length > remaining) {
-                run_length = remaining;
-            }
-
-            var i: usize = 0;
-            while (i < run_length) : (i += 1) {
-                curr_line[x.*] = ra;
-                x.* += 1;
-            }
-
-            if (ctx.run_index < 31) {
-                ctx.run_index += 1;
-            }
-
-            // If we filled the entire line, return.
-            if (x.* >= width) {
-                return;
-            }
-            // Otherwise loop to read the next segment.
-        } else {
-            // Partial segment -- read j bits for remainder.
-            const j: u5 = @intCast(ctx.j[ctx.run_index]);
-            const r_bits: u32 = if (j > 0) try br.readBits(@as(i32, j)) else 0;
-            var run_length: usize = @intCast(r_bits);
-
-            const remaining = width - x.*;
-            if (run_length > remaining) {
-                run_length = remaining;
-            }
-
-            var i: usize = 0;
-            while (i < run_length) : (i += 1) {
-                curr_line[x.*] = ra;
-                x.* += 1;
-            }
-
-            if (ctx.run_index > 0) {
-                ctx.run_index -= 1;
-            }
-
-            // End of line?
-            if (x.* >= width) {
-                return;
-            }
-
-            // Decode the interruption sample.
-            const q: usize = if (ra == rb) 365 else 366;
-            const k = ctx.computeK(q);
-            const mapped_err = try br.readGolomb(k);
-
-            const err_val: i32 = if (mapped_err % 2 == 0)
-                @intCast(mapped_err / 2)
-            else
-                -@as(i32, @intCast((mapped_err +% 1) / 2));
-
-            ctx.updateStats(q, err_val);
-
-            const pred = runInterruptionPrediction(ra, rb);
-            const px = pred[0];
-            const sign = pred[1];
-            // Use i64 for intermediate computation to avoid overflow.
-            var ix: i32 = @intCast(@as(i64, px) + @as(i64, sign) * @as(i64, err_val));
-
-            // Modulo reduction to [0, max_val].
-            const range_val = max_val + 1;
-            if (ix < 0) {
-                ix += range_val;
-            }
-            if (ix > max_val) {
-                ix -= range_val;
-            }
-            ix = std.math.clamp(ix, 0, max_val);
-
-            curr_line[x.*] = ix;
-            x.* += 1;
-            return;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Compute the prediction and sign for a run interruption sample.
-///
-/// Returns `{ Px, sign }`.
-fn runInterruptionPrediction(ra: i32, rb: i32) struct { i32, i32 } {
-    if (ra == rb) {
-        return .{ ra, 1 };
-    } else if (ra > rb) {
-        return .{ rb, -1 };
-    } else {
-        return .{ rb, 1 };
-    }
+    const rb = prev[end + 1];
+    cur[end + 1] = try decodeRunInterruption(br, ctx, ra, rb);
+    ctx.decrementRunIndex();
+    return end + 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,121 +261,32 @@ fn runInterruptionPrediction(ra: i32, rb: i32) struct { i32, i32 } {
 
 const testing = std.testing;
 
-/// Encode then decode a run and verify the output matches.
-fn roundtripRun(curr_line: []const i32, ra: i32, rb: i32) ![]i32 {
-    const width = curr_line.len;
-
-    // Encode
-    var buf = std.array_list.AlignedManaged(u8, null).init(testing.allocator);
-    defer buf.deinit();
-    {
-        var bw = BitWriter.init(&buf);
-        var ctx = try ContextModel.init(testing.allocator, 255, 0, 64);
-        defer ctx.deinit();
-        var x: usize = 0;
-        try encodeRun(&bw, &ctx, curr_line, &x, width, ra, rb);
-        try testing.expectEqual(width, x);
-        try bw.flush();
+test "map unmap roundtrip all corrections" {
+    for ([_]i32{ 0, -1 }) |correction| {
+        var err: i32 = -300;
+        while (err <= 300) : (err += 1) {
+            try testing.expectEqual(err, unmapError(mapError(err, correction), correction));
+        }
     }
-
-    // Decode
-    const out = try testing.allocator.alloc(i32, width);
-    @memset(out, 0);
-    {
-        var br = BitReader.init(buf.items);
-        var ctx = try ContextModel.init(testing.allocator, 255, 0, 64);
-        defer ctx.deinit();
-        var x: usize = 0;
-        try decodeRun(&br, &ctx, out, &x, width, ra, rb);
-        try testing.expectEqual(width, x);
-    }
-    return out;
 }
 
-test "run all same" {
-    const line = [_]i32{ 42, 42, 42, 42, 42, 42, 42, 42 };
-    const out = try roundtripRun(&line, 42, 42);
-    defer testing.allocator.free(out);
-    try testing.expectEqualSlices(i32, &line, out);
+test "quantize near0 identity" {
+    var e: i32 = -50;
+    while (e <= 50) : (e += 1) try testing.expectEqual(e, quantize(e, 0));
 }
 
-test "run with interruption" {
-    // 5 pixels of Ra=100, then one different pixel 120.
-    const line = [_]i32{ 100, 100, 100, 100, 100, 120 };
-    const ra: i32 = 100;
-    const rb: i32 = 100;
-    const width: usize = line.len;
-
-    var buf = std.array_list.AlignedManaged(u8, null).init(testing.allocator);
-    defer buf.deinit();
-    {
-        var bw = BitWriter.init(&buf);
-        var ctx = try ContextModel.init(testing.allocator, 255, 0, 64);
-        defer ctx.deinit();
-        var x: usize = 0;
-        try encodeRun(&bw, &ctx, &line, &x, width, ra, rb);
-        // x should be at 6 (past the interruption sample).
-        try testing.expectEqual(@as(usize, 6), x);
-        try bw.flush();
-    }
-
-    var out = [_]i32{0} ** 6;
-    {
-        var br = BitReader.init(buf.items);
-        var ctx = try ContextModel.init(testing.allocator, 255, 0, 64);
-        defer ctx.deinit();
-        var x: usize = 0;
-        try decodeRun(&br, &ctx, &out, &x, width, ra, rb);
-        try testing.expectEqual(@as(usize, 6), x);
-    }
-    try testing.expectEqualSlices(i32, &line, &out);
+test "quantize near symmetric" {
+    try testing.expectEqual(@as(i32, 0), quantize(0, 2));
+    try testing.expectEqual(@as(i32, 0), quantize(2, 2));
+    try testing.expectEqual(@as(i32, 0), quantize(-2, 2));
+    try testing.expectEqual(@as(i32, 1), quantize(3, 2));
+    try testing.expectEqual(@as(i32, -1), quantize(-3, 2));
+    try testing.expectEqual(@as(i32, 1), quantize(7, 2));
+    try testing.expectEqual(@as(i32, 2), quantize(8, 2));
 }
 
-test "run single pixel differs" {
-    // Immediate interruption: first pixel differs from Ra.
-    const line = [_]i32{50};
-    const ra: i32 = 100;
-    const rb: i32 = 100;
-    const width: usize = 1;
-
-    var buf = std.array_list.AlignedManaged(u8, null).init(testing.allocator);
-    defer buf.deinit();
-    {
-        var bw = BitWriter.init(&buf);
-        var ctx = try ContextModel.init(testing.allocator, 255, 0, 64);
-        defer ctx.deinit();
-        var x: usize = 0;
-        try encodeRun(&bw, &ctx, &line, &x, width, ra, rb);
-        try testing.expectEqual(@as(usize, 1), x);
-        try bw.flush();
-    }
-
-    var out = [_]i32{0};
-    {
-        var br = BitReader.init(buf.items);
-        var ctx = try ContextModel.init(testing.allocator, 255, 0, 64);
-        defer ctx.deinit();
-        var x: usize = 0;
-        try decodeRun(&br, &ctx, &out, &x, width, ra, rb);
-        try testing.expectEqual(@as(usize, 1), x);
-    }
-    try testing.expectEqualSlices(i32, &line, &out);
-}
-
-test "run interruption prediction same" {
-    const result = runInterruptionPrediction(100, 100);
-    try testing.expectEqual(@as(i32, 100), result[0]);
-    try testing.expectEqual(@as(i32, 1), result[1]);
-}
-
-test "run interruption prediction ra gt rb" {
-    const result = runInterruptionPrediction(200, 100);
-    try testing.expectEqual(@as(i32, 100), result[0]);
-    try testing.expectEqual(@as(i32, -1), result[1]);
-}
-
-test "run interruption prediction ra lt rb" {
-    const result = runInterruptionPrediction(50, 200);
-    try testing.expectEqual(@as(i32, 200), result[0]);
-    try testing.expectEqual(@as(i32, 1), result[1]);
+test "fix reconstructed lossless wraps" {
+    try testing.expectEqual(@as(i32, 255), fixReconstructed(-1, 0, 256, 255));
+    try testing.expectEqual(@as(i32, 0), fixReconstructed(256, 0, 256, 255));
+    try testing.expectEqual(@as(i32, 128), fixReconstructed(128, 0, 256, 255));
 }

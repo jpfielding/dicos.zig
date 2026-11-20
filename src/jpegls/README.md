@@ -1,17 +1,48 @@
-# jpegls
+# JPEG-LS Codec
 
-Pure Zig implementation of JPEG-LS (ITU-T T.87 / ISO/IEC 14495-1) encoder and decoder.
+Pure Zig implementation of JPEG-LS (ITU-T T.87 / ISO/IEC 14495-1) encoder and
+decoder. Port of the Rust `pure_jpegls` 2.1.0 crate (`dicos.rs`); for the same
+input and options the encoder emits byte-identical streams.
+
+## Conformance scope
+
+This module emits **conformant ITU-T T.87 streams**. Supported: LSE ID=1
+presets (MAXVAL/T1/T2/T3/RESET) honored on decode, run mode, near-lossless,
+sample precision `2..=16`, for:
+
+- **Single-component** images (`Nf = 1`) — `encode` / `decode`, and
+  `encodeImage` / `decodeImage`.
+- **Multi-component planar** images (`ILV = 0`: a shared frame header, then one
+  scan per component, e.g. RGB) — `encodeImage` / `decodeImage`.
+  `decodeImage` accepts 1 or 3 components; `encodeImage` accepts the same counts.
+
+Rejected: line- and sample-interleaved scans (`ILV = 1/2`), restart markers
+inside a scan (`RSTn`), LSE mapping tables, and component subsampling
+(`error.Unsupported`); a non-zero point transform or an impossible scan
+component count (`error.InvalidData`). A `DRI` segment on its own is tolerated
+and skipped. Interop is verified against third-party `.jls` fixtures when
+present (see `testdata/interop/README.md`) and, opt-in, against CharLS decoding
+our planar RGB output.
+
+### Profiles
+
+- `Profile.t87` (default) — ITU-T T.87 conformant output.
+- `Profile.legacy_go` — reproduces the frozen 1.0.0 / Go-compatible bytes
+  (T.81-style `0xFF00` stuffing, no run mode, uncapped Golomb); lossless only.
+
+Near-lossless and explicit precision are set through `EncodeOptions` via
+`encodeWithOptions`; `DecodeOptions` selects the decode profile.
 
 ## Features
 
-- **Lossless compression** using the LOCO-I algorithm
+- **Lossless and near-lossless** compression using the LOCO-I algorithm
 - **Context-based adaptive prediction** with Median Edge Detection (MED)
 - **Golomb-Rice entropy coding** with adaptive parameter selection
 - **Run-length mode** for efficient coding of uniform regions
-- **8-bit and 16-bit** grayscale images
+- **Grayscale and planar multi-component** (e.g. RGB, `ILV = 0`) images,
+  precision `2..=16`
 - **DICOS/DICOM compatible**: Transfer Syntax `1.2.840.10008.1.2.4.80`
-- **Allocator-aware**: All memory allocation goes through `std.mem.Allocator`
-- **Pure Zig**: No external codec dependencies
+- **Pure Zig**: no external codec dependencies; explicit allocators throughout
 
 ## Transfer Syntax
 
@@ -19,28 +50,90 @@ DICOM UID: `1.2.840.10008.1.2.4.80` (JPEG-LS Lossless)
 
 ## Usage
 
+The module is exposed by `build.zig` as `jpegls`.
+
 ### Encoding
 
+Encoders write to any `*std.Io.Writer` (flushed on success); the allocator is
+used only for line buffers.
+
 ```zig
-const std = @import("std");
 const jpegls = @import("jpegls");
 
-const pixels: []const u16 = // ... row-major 16-bit pixel buffer
-const compressed = try jpegls.encode.encode(allocator, pixels, 16, 16);
-defer allocator.free(compressed);
+var pixels: [256]u16 = undefined;
+for (&pixels, 0..) |*p, i| p.* = @intCast(i);
+
+var out = std.Io.Writer.Allocating.init(allocator);
+defer out.deinit();
+try jpegls.encode(allocator, &pixels, 16, 16, &out.writer);
+const compressed = out.written();
 ```
 
 ### Decoding
 
 ```zig
-const jpegls = @import("jpegls");
-
-const result = try jpegls.decode.decode(allocator, compressed, 16, 16);
-defer allocator.free(result[0]); // pixel data
-const pixels = result[0];
-const width = result[1];
-const height = result[2];
+const decoded = try jpegls.decode(allocator, compressed, 16, 16);
+defer allocator.free(decoded);
 ```
+
+### Options and diagnostics
+
+```zig
+var diag: jpegls.Diagnostic = .{};
+try jpegls.encodeWithOptions(allocator, &pixels, 16, 16, .{
+    .near = 2,              // near-lossless bound
+    .precision = 12,        // explicit precision (null = derive, at least 8)
+    .profile = .t87,        // or .legacy_go
+    .diagnostic = &diag,    // optional error detail
+}, &out.writer);
+
+const legacy = try jpegls.decodeWithOptions(allocator, old_bytes, w, h, .{ .profile = .legacy_go });
+```
+
+On error, `diag.message()` holds the same text the Rust `Display` impl
+produces, and the structured fields (`name`/`value`/`allowed`,
+`expected`/`actual`, `offset`, `marker`) mirror the Rust error variants'
+payloads.
+
+### Planar multi-component (e.g. RGB)
+
+`encodeImage` / `decodeImage` take and return **component-planar** samples
+(all of component 0, then component 1, ...). `decodeImage` reads the geometry
+from the codestream and returns it with the frame metadata.
+
+`decodeImage` limits the output sample buffer to 64 MiB by default. Use
+`decodeImageWithOptions` with `.{ .max_decoded_bytes = n }` to select a
+different budget; every component counts toward this limit, and it is checked
+before allocating.
+
+```zig
+var planar: [3 * 256]u16 = undefined; // R, G, B planes
+for (&planar, 0..) |*p, i| p.* = @intCast(i % 256);
+
+var rgb = std.Io.Writer.Allocating.init(allocator);
+defer rgb.deinit();
+try jpegls.encodeImage(allocator, &planar, 16, 16, 3, .{}, &rgb.writer);
+
+var img = try jpegls.decodeImage(allocator, rgb.written());
+defer img.deinit(allocator);
+// img.width == 16, img.height == 16, img.components == 3
+// std.mem.eql(u16, img.samples, &planar)
+```
+
+## Errors
+
+`CodecError` mirrors the Rust `CodecError` variants:
+
+| Error | Meaning |
+|-------|---------|
+| `Io` | the output writer failed |
+| `InvalidData` | malformed or inconsistent codestream |
+| `Unsupported` | valid feature not implemented (ILV 1/2, RSTn, mapping tables, subsampling) |
+| `DimensionMismatch` | sample count does not match the geometry |
+| `Truncated` | the scan ended (marker / end of data / corrupt code) before all samples decoded |
+| `InvalidParameter` | caller or in-stream parameter out of range |
+| `Marker` | a marker was hit inside the entropy-coded scan (internal; surfaces as `Truncated`/`Unsupported`) |
+| `OutOfMemory` | allocator failure (line buffers / `decode` output) |
 
 ## JPEG-LS Algorithm
 
@@ -67,23 +160,6 @@ neighboring samples used for prediction and context determination:
 - **c** = sample diagonally above-left
 - **d** = sample diagonally above-right
 
-### Median Edge Detector (MED)
-
-The MED predictor selects among three prediction modes based on local gradients:
-
-```
-if c >= max(a, b):
-    predict = min(a, b)      -- vertical edge detected
-elif c <= min(a, b):
-    predict = max(a, b)      -- horizontal edge detected
-else:
-    predict = a + b - c      -- no dominant edge
-```
-
-This adaptive prediction captures both horizontal and vertical edges efficiently,
-which is critical for medical/security imaging where images contain sharp
-boundaries between materials.
-
 ### Context Modeling
 
 The encoder maintains 365 regular contexts plus 2 run-mode contexts, each
@@ -91,19 +167,12 @@ with adaptive A/B/C/N statistics that are updated after every sample. These
 statistics drive both the bias cancellation and the Golomb-Rice parameter
 selection, allowing the codec to adapt to local image characteristics.
 
-### Golomb-Rice Coding
+## Supported Image Types
 
-Prediction residuals are coded using Golomb-Rice codes parameterized by `k`:
-- The quotient `q = residual >> k` is coded in unary
-- The remainder `r = residual & ((1 << k) - 1)` is coded in `k` binary bits
-- The parameter `k` is adaptively selected per-context from the running statistics
-
-### Run-Length Mode
-
-When all local gradients (Q1, Q2, Q3) are zero, the encoder enters run-length
-mode. Consecutive pixels identical to the reconstruction value of `a` are counted
-and coded using Golomb codes, which is highly efficient for uniform image regions
-common in security screening backgrounds.
+| Pixel Type | Precision | Components | Description |
+|------------|-----------|------------|-------------|
+| `u16` | `2..=16` bits | 1 (`Nf = 1`, `ILV = 0`) | single-component grayscale |
+| `u16` | `2..=16` bits | 3 (`Nf = 3`, `ILV = 0`) | planar multi-component, e.g. RGB |
 
 ## JPEG-LS Stream Format
 
@@ -116,93 +185,40 @@ LSE   - JPEG-LS Preset Parameters (0xFFF8, optional)
 SOS   - Start of Scan (0xFFDA)
         Component selector, Near parameter (0 = lossless)
 [entropy-coded image data]
+(SOS + scan repeat once per component for planar, ILV = 0, multi-component)
 EOI   - End of Image (0xFFD9)
 ```
 
-## Public Types and Functions
-
-### `encode.zig`
-
-| Symbol | Type | Description |
-|--------|------|-------------|
-| `encode` | `fn(Allocator, []const u16, u32, u32) CodecError![]u8` | Encode 16-bit pixels to JPEG-LS bitstream |
-
-### `decode.zig`
-
-| Symbol | Type | Description |
-|--------|------|-------------|
-| `decode` | `fn(Allocator, []const u8, u32, u32) CodecError!struct{[]u16, u32, u32}` | Decode JPEG-LS bitstream to 16-bit pixels |
-
-### `context.zig`
-
-| Symbol | Type | Description |
-|--------|------|-------------|
-| `ContextModel` | `struct` | Manages 365 regular contexts + 2 run contexts with A/B/C/N statistics |
-
-### `predictor.zig`
-
-| Symbol | Type | Description |
-|--------|------|-------------|
-| `predictMed` | `fn(i32, i32, i32) i32` | Median Edge Detector prediction |
-| `clampVal` | `fn(i32, i32) i32` | Clamp prediction to valid range |
-
-### `bitstream.zig`
-
-| Symbol | Type | Description |
-|--------|------|-------------|
-| `BitWriter` | `struct` | Bit-level output with JPEG byte-stuffing |
-| `BitReader` | `struct` | Bit-level input with JPEG byte-stuffing |
-| `CodecError` | `error` | `InvalidData`, `DimensionMismatch`, `OutOfMemory`, `EndOfStream`, `Unsupported` |
-
-### `run_mode.zig`
-
-Run-length mode encoding and decoding for uniform regions.
-
-### Root (`jpegls`)
-
-| Symbol | Type | Description |
-|--------|------|-------------|
-| `TRANSFER_SYNTAX_UID` | `[]const u8` | `"1.2.840.10008.1.2.4.80"` |
-| `bitstream` | module | Bit-level I/O utilities |
-| `context` | module | Context modeling with adaptive statistics |
-| `predictor` | module | MED predictor and gradient computation |
-| `run_mode` | module | Run-length mode for uniform regions |
-| `encode` | module | Full encoder pipeline |
-| `decode` | module | Full decoder pipeline |
-
-## Module Structure
+## Architecture
 
 ```
-jpegls/
-  root.zig        Public API, TRANSFER_SYNTAX_UID constant, module re-exports
-  encode.zig      Encoder: prediction + context + Golomb-Rice output
-  decode.zig      Decoder: Golomb-Rice input + context + reconstruction
-  predictor.zig   MED predictor and gradient computation
-  context.zig     Context modeling with adaptive A/B/C/N statistics
-  run_mode.zig    Run-length mode for uniform regions
-  bitstream.zig   Bit-level I/O utilities with JPEG byte-stuffing
+src/jpegls/
+  root.zig       # Public API (encode*, decode*, Profile, options, TRANSFER_SYNTAX_UID)
+  options.zig    # Profile, EncodeOptions, DecodeOptions, DecodeImageOptions
+  error.zig      # CodecError + Diagnostic
+  encode.zig     # Encoder: prediction + context + Golomb-Rice output
+  decode.zig     # Decoder: marker parsing, LSE presets, scan reconstruction
+  predictor.zig  # MED predictor and clamping
+  context.zig    # Context modeling with adaptive A/B/C/N statistics
+  run_mode.zig   # Run-length mode + shared sample arithmetic
+  bitstream.zig  # T.87 bit I/O (single-bit stuffing, limited Golomb)
+  legacy.zig     # Frozen 1.0.0 / Go-compatible coder (do not modify)
+  tests/         # Ported Rust integration tests, Rust byte-parity, fuzz smoke
+  testdata/      # Legacy fixtures, fuzz regressions, parity manifest, interop
 ```
 
-## Tests
+## Testing
 
-Run the jpegls tests:
+`zig build test` (or `zig test src/jpegls/root.zig`, since the module has no
+imports). The suite ports every Rust unit and integration test, plus:
 
-```sh
-zig build test
-```
-
-The module includes 51 tests covering:
-
-- Bitstream read/write round-trips (single bits, multi-bit values, byte-stuffing)
-- Context initialization and statistics updates
-- MED predictor correctness (horizontal edge, vertical edge, smooth gradient)
-- Golomb-Rice coding round-trips with various k parameters
-- Run-length mode encode/decode (short runs, long runs, maximum runs)
-- Full pipeline encode/decode round-trips (small images, gradients, random data)
-- 16-bit precision handling (full u16 range, near-maximum values)
-- Edge cases (1x1 images, single-row images, single-column images)
-- Marker parsing validation (SOI, SOF55, SOS, LSE, EOI)
-- Dimension mismatch and malformed data error handling
+- `tests/parity.zig` — 849 encoder outputs (T.87 across precisions 2..=16 and
+  NEAR 0/1/3, default `encode`, LegacyGo, 3-component `encodeImage`) must
+  hash identically to the Rust crate's (`testdata/parity_manifest.txt`).
+- `tests/fuzz_smoke.zig` — deterministic, bounded ports of the Rust
+  `cargo fuzz` targets and their oracles.
+- CharLS-dependent tests skip (`error.SkipZigTest`) unless fixtures are
+  present / `DICOS_CHARLS_INTEROP=1` is set.
 
 ## References
 
