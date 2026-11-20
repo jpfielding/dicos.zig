@@ -128,18 +128,29 @@ pub fn build(b: *std.Build) void {
     zoxel.linkLibrary(zglfw.artifact("glfw"));
     zoxel.linkLibrary(zgpu.artifact("zdawn"));
     zoxel.linkLibrary(zgui.artifact("imgui"));
+    // Works around zgui's ImTextureRef/ImTextureID ABI mismatch in AddImage.
+    zoxel.addCSourceFile(.{ .file = b.path("src/zoxel/imgui_shim.cpp"), .flags = &.{ "-fno-sanitize=undefined", "-DIMGUI_DISABLE_OBSOLETE_FUNCTIONS" } });
+    zoxel.addIncludePath(b.path("deps/zgui/libs/imgui"));
+    zoxel.linkLibCpp();
     @import("zgpu").addLibraryPathsTo(zoxel);
     b.installArtifact(zoxel);
 
-    // zoxel's GPU-free logic (volume, loading, camera, transfer, slices,
-    // layout math) is tested without a window: `zig build zoxel-test`.
+    // zoxel tests need no window or GPU (volume, loading, camera, transfer,
+    // slices, and headless UI layout/interaction): `zig build zoxel-test`.
     const zoxel_test_mod = b.createModule(.{
         .root_source_file = b.path("src/zoxel/tests.zig"),
         .target = target,
         .optimize = optimize,
     });
     zoxel_test_mod.addImport("dicos", dicos_mod);
+    // UI layout tests run headless through the same kit (ImGui text metrics,
+    // no window or GPU).
+    zoxel_test_mod.addImport("zgui", zgui.module("root"));
     const zoxel_tests = b.addTest(.{ .root_module = zoxel_test_mod });
+    zoxel_tests.linkLibrary(zgui.artifact("imgui"));
+    zoxel_tests.addCSourceFile(.{ .file = b.path("src/zoxel/imgui_shim.cpp"), .flags = &.{ "-fno-sanitize=undefined", "-DIMGUI_DISABLE_OBSOLETE_FUNCTIONS" } });
+    zoxel_tests.addIncludePath(b.path("deps/zgui/libs/imgui"));
+    zoxel_tests.linkLibCpp();
     const run_zoxel_tests = b.addRunArtifact(zoxel_tests);
     const zoxel_test_step = b.step("zoxel-test", "Run zoxel unit tests");
     zoxel_test_step.dependOn(&run_zoxel_tests.step);

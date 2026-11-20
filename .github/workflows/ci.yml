@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Keep in sync with .github/workflows/pages.yml and .devcontainer/Dockerfile.
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  test:
+    name: fmt / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Format
+        run: zig fmt --check build.zig src
+
+      # Exercises the example generator end to end (writes the gitignored
+      # testdata/synthetic/ fixture) and validates it produces a DICOS file.
+      - name: Generate synthetic fixture
+        run: |
+          mkdir -p testdata/synthetic
+          zig build gen-luggage-fishtank -- \
+            --size 64,64,48 \
+            --out testdata/synthetic/luggage_fishtank_ct.dcs
+
+      - name: Test
+        run: zig build test --summary all
+
+      - name: Viewer logic tests
+        run: zig build zoxel-test --summary all

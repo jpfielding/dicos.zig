@@ -50,13 +50,13 @@ RUN set -eux && \
     cd ${SDK_HOME} && mv go go${GO_VERSION} && ln -s go${GO_VERSION} go
 
 # zig
-ENV ZIG_VERSION "0.14.1"
+ENV ZIG_VERSION "0.15.2"
 RUN set -eux && \
     export ZIG_ARCH="$(arch | sed 's/aarch64/aarch64/' | sed 's/x86_64/x86_64/')" && \
     cd /tmp && \
-    curl -k -o zig.tar.xz -L https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz && \
+    curl -k -o zig.tar.xz -L https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz && \
     tar xf zig.tar.xz && \
-    mv zig-linux-${ZIG_ARCH}-${ZIG_VERSION} ${SDK_HOME}/zig && \
+    mv zig-${ZIG_ARCH}-linux-${ZIG_VERSION} ${SDK_HOME}/zig && \
     rm /tmp/zig.tar.xz
 ENV PATH ${SDK_HOME}/zig:${PATH}
 

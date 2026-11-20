@@ -1,36 +1,55 @@
+//! Arcball camera for 3D volume viewing.
+//!
+//! An orbit camera rotating around a target point, with screen-space panning,
+//! zoom and an automatic fit of the whole volume. World space is the physical
+//! volume extent normalised by its X length (see `physicalExtent`).
+
 const std = @import("std");
 
 pub const Vec3 = struct {
-    x: f32,
-    y: f32,
-    z: f32,
+    x: f32 = 0,
+    y: f32 = 0,
+    z: f32 = 0,
+
+    pub const zero: Vec3 = .{};
+    pub const one: Vec3 = .{ .x = 1, .y = 1, .z = 1 };
+    pub const unit_x: Vec3 = .{ .x = 1 };
+    pub const unit_y: Vec3 = .{ .y = 1 };
+    pub const unit_z: Vec3 = .{ .z = 1 };
 
     pub fn init(x: f32, y: f32, z: f32) Vec3 {
         return .{ .x = x, .y = y, .z = z };
     }
-
+    pub fn fromArray(a: [3]f32) Vec3 {
+        return .{ .x = a[0], .y = a[1], .z = a[2] };
+    }
+    pub fn toArray(v: Vec3) [3]f32 {
+        return .{ v.x, v.y, v.z };
+    }
     pub fn add(a: Vec3, b: Vec3) Vec3 {
         return .{ .x = a.x + b.x, .y = a.y + b.y, .z = a.z + b.z };
     }
-
     pub fn sub(a: Vec3, b: Vec3) Vec3 {
         return .{ .x = a.x - b.x, .y = a.y - b.y, .z = a.z - b.z };
     }
-
+    pub fn mul(a: Vec3, b: Vec3) Vec3 {
+        return .{ .x = a.x * b.x, .y = a.y * b.y, .z = a.z * b.z };
+    }
+    pub fn div(a: Vec3, b: Vec3) Vec3 {
+        return .{ .x = a.x / b.x, .y = a.y / b.y, .z = a.z / b.z };
+    }
     pub fn scale(v: Vec3, s: f32) Vec3 {
         return .{ .x = v.x * s, .y = v.y * s, .z = v.z * s };
     }
-
+    pub fn dot(a: Vec3, b: Vec3) f32 {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
     pub fn length(v: Vec3) f32 {
-        return @sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+        return @sqrt(v.dot(v));
     }
-
     pub fn normalize(v: Vec3) Vec3 {
-        const len = v.length();
-        if (len < 1e-8) return .{ .x = 0, .y = 0, .z = 0 };
-        return v.scale(1.0 / len);
+        return v.scale(1.0 / v.length());
     }
-
     pub fn cross(a: Vec3, b: Vec3) Vec3 {
         return .{
             .x = a.y * b.z - a.z * b.y,
@@ -38,129 +57,198 @@ pub const Vec3 = struct {
             .z = a.x * b.y - a.y * b.x,
         };
     }
+    pub fn minElement(v: Vec3) f32 {
+        return @min(v.x, @min(v.y, v.z));
+    }
+    pub fn eql(a: Vec3, b: Vec3) bool {
+        return a.x == b.x and a.y == b.y and a.z == b.z;
+    }
 };
+
+/// Physical volume dimensions normalised by physical X length. Invalid
+/// spacing falls back to one unit per voxel on that axis. No aspect clamp:
+/// narrow and anisotropic volumes keep their geometry.
+pub fn physicalExtent(dims: [3]usize, spacing: [3]f64) Vec3 {
+    var physical: [3]f64 = undefined;
+    for (0..3) |axis| {
+        const s = if (std.math.isFinite(spacing[axis]) and spacing[axis] > 0.0) spacing[axis] else 1.0;
+        physical[axis] = @as(f64, @floatFromInt(@max(dims[axis], 1))) * s;
+    }
+    return .{
+        .x = 1.0,
+        .y = @floatCast(physical[1] / physical[0]),
+        .z = @floatCast(physical[2] / physical[0]),
+    };
+}
 
 /// Arcball camera orbiting a target point.
 pub const Camera = struct {
-    target: Vec3 = Vec3.init(0.5, 0.5, 0.5),
-    azimuth: f32 = 0.5,
-    elevation: f32 = -0.4,
+    /// Target point in physical world coordinates.
+    target: Vec3 = .{ .x = 0.5, .y = 0.5, .z = 0.5 },
+    /// Azimuth (radians, around Y). Slight oblique view by default.
+    azimuth: f32 = 0.25,
+    /// Elevation (radians). Inspect the open volume from above.
+    elevation: f32 = -1.1,
     distance: f32 = 1.0,
+    /// Vertical field-of-view factor (a ray spread, not degrees).
     fov: f32 = 0.8,
+    max_distance: f32 = MAX_DISTANCE,
 
-    /// Compute the camera position in world space.
+    pub const MIN_DISTANCE: f32 = 0.5;
+    pub const MAX_DISTANCE: f32 = 5.0;
+
+    /// Fit all eight volume corners into the viewport with a 6% margin.
+    pub fn fitBounds(self: *Camera, min: Vec3, max: Vec3, aspect: f32) void {
+        self.target = min.add(max).scale(0.5);
+        const fwd = self.forward();
+        const rgt = self.right();
+        const upv = self.up();
+        var distance: f32 = MIN_DISTANCE;
+        for ([_]f32{ min.x, max.x }) |x| {
+            for ([_]f32{ min.y, max.y }) |y| {
+                for ([_]f32{ min.z, max.z }) |z| {
+                    const delta = Vec3.init(x, y, z).sub(self.target);
+                    const depth = delta.dot(fwd);
+                    distance = @max(distance, @abs(delta.dot(rgt)) * 1.06 / (self.fov * @max(aspect, 0.1)) - depth);
+                    distance = @max(distance, @abs(delta.dot(upv)) * 1.06 / self.fov - depth);
+                }
+            }
+        }
+        self.max_distance = @max(MAX_DISTANCE, distance * 2.0);
+        self.distance = @max(distance, MIN_DISTANCE);
+    }
+
     pub fn position(self: Camera) Vec3 {
-        const sin_az = @sin(self.azimuth);
-        const cos_az = @cos(self.azimuth);
-        const sin_el = @sin(self.elevation);
-        const cos_el = @cos(self.elevation);
-
-        return Vec3.init(
-            sin_az * cos_el * self.distance + self.target.x,
-            sin_el * self.distance + self.target.y,
-            cos_az * cos_el * self.distance + self.target.z,
-        );
+        const sa = @sin(self.azimuth);
+        const ca = @cos(self.azimuth);
+        const se = @sin(self.elevation);
+        const ce = @cos(self.elevation);
+        return .{
+            .x = sa * ce * self.distance + self.target.x,
+            .y = se * self.distance + self.target.y,
+            .z = ca * ce * self.distance + self.target.z,
+        };
     }
 
-    /// Compute the forward direction (toward target).
     pub fn forward(self: Camera) Vec3 {
-        return Vec3.sub(self.target, self.position()).normalize();
+        return self.target.sub(self.position()).normalize();
     }
 
-    /// Compute the right vector.
     pub fn right(self: Camera) Vec3 {
-        const cos_az = @cos(self.azimuth);
-        const sin_az = @sin(self.azimuth);
-        return Vec3.init(cos_az, 0.0, -sin_az);
+        return .{ .x = @cos(self.azimuth), .y = 0, .z = -@sin(self.azimuth) };
     }
 
-    /// Compute the up vector.
     pub fn up(self: Camera) Vec3 {
-        return Vec3.cross(self.forward(), self.right()).normalize();
+        return self.forward().cross(self.right()).normalize();
     }
 
-    /// Rotate the camera by delta angles (in radians).
-    pub fn rotate(self: *Camera, delta_azimuth: f32, delta_elevation: f32) void {
-        self.azimuth += delta_azimuth;
-        self.elevation = std.math.clamp(
-            self.elevation + delta_elevation,
-            -std.math.pi / 2.0 + 0.01,
-            std.math.pi / 2.0 - 0.01,
-        );
+    pub fn rotate(self: *Camera, d_azimuth: f32, d_elevation: f32) void {
+        self.azimuth += d_azimuth;
+        self.elevation += d_elevation;
     }
 
-    /// Zoom by a multiplicative factor.
+    /// Zoom by a multiplicative factor (>1 zooms in).
     pub fn zoom(self: *Camera, factor: f32) void {
-        self.distance = std.math.clamp(self.distance / factor, 0.5, 5.0);
+        self.distance = std.math.clamp(self.distance / factor, MIN_DISTANCE, self.max_distance);
     }
 
-    /// Pan the camera target in view space.
-    pub fn panPixels(self: *Camera, delta_x: f32, delta_y: f32) void {
+    /// Pan the target in view space by pixel deltas (x right, y down).
+    pub fn panPixels(self: *Camera, dx: f32, dy: f32) void {
         const s = self.distance * 0.0015;
-        const r = self.right();
-        const u = self.up();
-        self.target = Vec3.add(self.target, Vec3.add(
-            Vec3.scale(r, -delta_x * s),
-            Vec3.scale(u, delta_y * s),
-        ));
+        self.target = self.target.add(self.right().scale(-dx).add(self.up().scale(dy)).scale(s));
     }
 
     pub fn setAxial(self: *Camera) void {
-        // Top-down: camera above on +Y, looking at X-Z plane
-        self.azimuth = 0.0;
-        self.elevation = std.math.pi / 2.0 - 0.01;
+        self.azimuth = 0;
+        self.elevation = 0;
     }
 
     pub fn setCoronal(self: *Camera) void {
-        // Front view: camera on +Z, looking at X-Y plane
-        self.azimuth = 0.0;
-        self.elevation = 0.0;
+        self.azimuth = 0;
+        self.elevation = -std.math.pi / 2.0 + 0.01;
     }
 
     pub fn setSagittal(self: *Camera) void {
-        // Side view: camera on +X, looking at Y-Z plane
         self.azimuth = std.math.pi / 2.0;
-        self.elevation = 0.0;
+        self.elevation = 0;
     }
 };
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-test "default camera looks at center" {
-    const cam = Camera{};
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), cam.target.x, 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), cam.target.y, 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), cam.target.z, 1e-4);
+
+const testing = std.testing;
+
+test "anisotropic samples form a physical cube" {
+    try testing.expect(physicalExtent(.{ 100, 50, 25 }, .{ 1, 2, 4 }).eql(Vec3.one));
+    try testing.expect(physicalExtent(.{ 256, 128, 256 }, .{ 1, 1, 1 }).eql(Vec3.init(1, 0.5, 1)));
+    try testing.expect(physicalExtent(.{ 100, 200, 1 }, .{ 1, 1, 1 }).eql(Vec3.init(1, 2, 0.01)));
 }
 
-test "position at default angles" {
-    const cam = Camera{};
-    const pos = cam.position();
-    const diff = Vec3.sub(pos, cam.target);
-    const dist = diff.length();
-    try std.testing.expectApproxEqAbs(cam.distance, dist, 1e-4);
+test "physical geometry camera fit covers all corners without aspect clamp" {
+    const cases = [_]struct { d: [3]usize, s: [3]f64 }{
+        .{ .d = .{ 100, 50, 25 }, .s = .{ 1, 2, 4 } },
+        .{ .d = .{ 256, 128, 256 }, .s = .{ 1, 1, 1 } },
+        .{ .d = .{ 10, 500, 100 }, .s = .{ 1, 1, 1 } },
+    };
+    for (cases) |c| {
+        const extent = physicalExtent(c.d, c.s);
+        for ([_]f32{ 0.5, 1.0, 2.0 }) |aspect| {
+            var cam = Camera{};
+            cam.fitBounds(Vec3.zero, extent, aspect);
+            try testing.expect(cam.target.eql(extent.scale(0.5)));
+            const fit = cam.distance;
+            cam.zoom(1.0);
+            try testing.expectEqual(fit, cam.distance);
+            for ([_]f32{ 0, extent.x }) |x| for ([_]f32{ 0, extent.y }) |y| for ([_]f32{ 0, extent.z }) |z| {
+                const delta = Vec3.init(x, y, z).sub(cam.position());
+                const depth = delta.dot(cam.forward());
+                try testing.expect(depth > 0);
+                try testing.expect(@abs(delta.dot(cam.right())) < depth * cam.fov * aspect);
+                try testing.expect(@abs(delta.dot(cam.up())) < depth * cam.fov);
+            };
+        }
+    }
 }
 
-test "zoom clamps" {
+test "fitted volume corners stay inside viewport" {
+    for ([_]f32{ 0.8, 1.2, 2.0 }) |aspect| {
+        for ([_]f32{ 0.1, 0.5, 1.0, 2.0 }) |depth_z| {
+            var cam = Camera{};
+            cam.fitBounds(Vec3.zero, Vec3.init(1, 1, depth_z), aspect);
+            for ([_]f32{ 0, 1 }) |x| for ([_]f32{ 0, 1 }) |y| for ([_]f32{ 0, depth_z }) |z| {
+                const delta = Vec3.init(x, y, z).sub(cam.position());
+                const d = delta.dot(cam.forward());
+                try testing.expect(d > 0);
+                try testing.expect(@abs(delta.dot(cam.right())) / (d * cam.fov * aspect) < 1.0);
+                try testing.expect(@abs(delta.dot(cam.up())) / (d * cam.fov) < 1.0);
+            };
+        }
+    }
+}
+
+test "default camera" {
+    const cam = Camera{};
+    try testing.expect(cam.target.eql(Vec3.init(0.5, 0.5, 0.5)));
+    try testing.expect(@abs(cam.position().sub(cam.target).length() - cam.distance) < 1e-4);
+    try testing.expect(cam.forward().z < 0);
+}
+
+test "zoom clamps, rotation is continuous, pan moves target" {
     var cam = Camera{};
     cam.zoom(100.0);
-    try std.testing.expect(cam.distance >= 0.5);
+    try testing.expect(cam.distance >= 0.5);
     cam.zoom(0.001);
-    try std.testing.expect(cam.distance <= 5.0);
-}
+    try testing.expect(cam.distance <= 5.0);
 
-test "rotation clamps elevation" {
-    var cam = Camera{};
-    cam.rotate(0.0, 100.0);
-    try std.testing.expect(cam.elevation < std.math.pi / 2.0);
-    cam.rotate(0.0, -200.0);
-    try std.testing.expect(cam.elevation > -std.math.pi / 2.0);
-}
+    var c2 = Camera{};
+    const start = c2.elevation;
+    c2.rotate(0, std.math.pi);
+    try testing.expect(@abs(c2.elevation - (start + std.math.pi)) < 1e-6);
 
-test "pan changes target" {
-    var cam = Camera{};
-    const start_x = cam.target.x;
-    cam.panPixels(10.0, -8.0);
-    try std.testing.expect(cam.target.x != start_x or cam.target.y != 0.5 or cam.target.z != 0.5);
+    var c3 = Camera{};
+    const t0 = c3.target;
+    c3.panPixels(10, -8);
+    try testing.expect(!c3.target.eql(t0));
 }
