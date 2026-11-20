@@ -57,7 +57,7 @@ pub fn build(b: *std.Build) void {
     // -----------------------------------------------------------------------
     // Browser build of zoxel:
     //   zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseFast [-Demsdk=<dir>]
-    // writes zig-out/web/{index.html,zoxel.js,zoxel.wasm}. Zig compiles static
+    // writes zig-out/web/{index.html,index.js,index.wasm}. Zig compiles static
     // libraries and emsdk's emcc links them; no other steps exist for this
     // target.
     // -----------------------------------------------------------------------
